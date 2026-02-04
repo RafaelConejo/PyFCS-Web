@@ -146,3 +146,14 @@ class PyFCSWebApp:
 
 app = PyFCSWebApp()
 ui.run(title='PyFCS Web', port=8080)
+
+
+
+import os
+
+if __name__ == '__main__':
+    ui.run(
+        host='0.0.0.0',
+        port=int(os.environ.get('PORT', 8080)),
+        title='PyFCS Web',
+    )
