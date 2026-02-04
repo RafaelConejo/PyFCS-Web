@@ -13,7 +13,7 @@ pyfcs_dir = os.path.abspath(os.path.join(current_dir, '..', '..'))
 # Add the PyFCS path to sys.path
 sys.path.append(pyfcs_dir)
 
-from PyFCS import Input, VisualManager, ReferenceDomain, FuzzyColorSpace, ImageManager, FuzzyColorSpaceManager, ColorEvaluationManager
+from PyFCS import Input, VisualManager, ReferenceDomain, FuzzyColorSpace, FuzzyColorSpaceManager, ColorEvaluationManager
 import PyFCS.interface.modules.UtilsTools as UtilsTools
 
 class PyFCSWebApp:
