@@ -1,8 +1,8 @@
 import os
 import numpy as np
 from skimage import color
-import tkinter as tk
-from tkinter import ttk, filedialog
+# import tkinter as tk
+# from tkinter import ttk, filedialog
 import colorsys
 
 ### my libraries ###
@@ -65,17 +65,17 @@ def srgb_to_lab(r, g, b):
 
 
 
-def prompt_file_selection(initial_subdir):
-    """
-    Prompts the user to select a file and returns the selected filename.
-    """
-    initial_directory = os.path.join(os.getcwd(), initial_subdir)
-    filetypes = [("All Files", "*.*")]
-    return filedialog.askopenfilename(
-        title="Select Fuzzy Color Space File",
-        initialdir=initial_directory,
-        filetypes=filetypes
-    )
+# def prompt_file_selection(initial_subdir):
+#     """
+#     Prompts the user to select a file and returns the selected filename.
+#     """
+#     initial_directory = os.path.join(os.getcwd(), initial_subdir)
+#     filetypes = [("All Files", "*.*")]
+#     return filedialog.askopenfilename(
+#         title="Select Fuzzy Color Space File",
+#         initialdir=initial_directory,
+#         filetypes=filetypes
+#     )
 
 
 def process_prototypes(color_data):
@@ -109,66 +109,66 @@ def load_color_data(file_path):
 
 
 
-def create_popup_window(parent, title, width, height, header_text):
-    """
-    Creates a popup window with a header and a scrollable frame.
-    Returns the popup window and the scrollable frame.
-    """
-    popup = tk.Toplevel(parent)
-    popup.title(title)
-    popup.geometry(f"{width}x{height}")
-    popup.configure(bg="#f5f5f5")
+# def create_popup_window(parent, title, width, height, header_text):
+#     """
+#     Creates a popup window with a header and a scrollable frame.
+#     Returns the popup window and the scrollable frame.
+#     """
+#     popup = tk.Toplevel(parent)
+#     popup.title(title)
+#     popup.geometry(f"{width}x{height}")
+#     popup.configure(bg="#f5f5f5")
 
-    tk.Label(
-        popup,
-        text=header_text,
-        font=("Helvetica", 14, "bold"),
-        bg="#f5f5f5"
-    ).pack(pady=15)
+#     tk.Label(
+#         popup,
+#         text=header_text,
+#         font=("Helvetica", 14, "bold"),
+#         bg="#f5f5f5"
+#     ).pack(pady=15)
 
-    # Create a scrollable frame
-    frame_container = ttk.Frame(popup)
-    frame_container.pack(pady=10, fill="both", expand=True)
+#     # Create a scrollable frame
+#     frame_container = ttk.Frame(popup)
+#     frame_container.pack(pady=10, fill="both", expand=True)
 
-    canvas = tk.Canvas(frame_container, bg="#f5f5f5")
-    scrollbar = ttk.Scrollbar(frame_container, orient="vertical", command=canvas.yview)
-    scrollable_frame = ttk.Frame(canvas)
+#     canvas = tk.Canvas(frame_container, bg="#f5f5f5")
+#     scrollbar = ttk.Scrollbar(frame_container, orient="vertical", command=canvas.yview)
+#     scrollable_frame = ttk.Frame(canvas)
 
-    scrollable_frame.bind(
-        "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-    )
-    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-    canvas.configure(yscrollcommand=scrollbar.set)
+#     scrollable_frame.bind(
+#         "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+#     )
+#     canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+#     canvas.configure(yscrollcommand=scrollbar.set)
 
-    canvas.pack(side="left", fill="both", expand=True)
-    scrollbar.pack(side="right", fill="y")
+#     canvas.pack(side="left", fill="both", expand=True)
+#     scrollbar.pack(side="right", fill="y")
 
-    return popup, scrollable_frame
+#     return popup, scrollable_frame
 
 
 
-@staticmethod
-def create_selection_popup(parent, title, width, height, items):
-    """
-    Creates a popup window with a listbox to select an item.
-    Returns the popup window and the listbox widget.
-    """
-    popup = tk.Toplevel(parent)
-    popup.title(title)
-    popup.geometry(f"{width}x{height}")
-    popup.resizable(False, False)
+# @staticmethod
+# def create_selection_popup(parent, title, width, height, items):
+#     """
+#     Creates a popup window with a listbox to select an item.
+#     Returns the popup window and the listbox widget.
+#     """
+#     popup = tk.Toplevel(parent)
+#     popup.title(title)
+#     popup.geometry(f"{width}x{height}")
+#     popup.resizable(False, False)
 
-    # Add a listbox to display the items
-    listbox = tk.Listbox(popup, width=40, height=10)
-    for item in items:
-        listbox.insert(tk.END, item)
-    listbox.pack(pady=10)
+#     # Add a listbox to display the items
+#     listbox = tk.Listbox(popup, width=40, height=10)
+#     for item in items:
+#         listbox.insert(tk.END, item)
+#     listbox.pack(pady=10)
 
-    # Center the popup relative to the parent window
-    popup.transient(parent)
-    popup.grab_set()
+#     # Center the popup relative to the parent window
+#     popup.transient(parent)
+#     popup.grab_set()
 
-    return popup, listbox
+#     return popup, listbox
 
 
 
