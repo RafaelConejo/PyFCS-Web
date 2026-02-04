@@ -9,7 +9,7 @@ import PyFCS.interface.modules.UtilsTools as UtilsTools
 class FuzzyColorSpaceManager:
     SUPPORTED_EXTENSIONS = {'.cns', '.fcs'}
 
-    def __init__(self, root):
+    def __init__(self, root=None):
         self.root = root
 
     @staticmethod
