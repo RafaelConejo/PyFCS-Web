@@ -5,7 +5,7 @@ from .fuzzy.FuzzyColorSpace import FuzzyColorSpace
 from .interface.modules.VisualManager import VisualManager
 from .colorspace.ReferenceDomain import ReferenceDomain
 from .geometry.Point import Point
-from .interface.modules.ImageManager import ImageManager
+#from .interface.modules.ImageManager import ImageManager
 from .interface.modules.FuzzyColorSpaceManager import FuzzyColorSpaceManager
 from .interface.modules.ColorEvaluationManager import ColorEvaluationManager
 #from .interface.modules.UtilsTools import UtilsTools
