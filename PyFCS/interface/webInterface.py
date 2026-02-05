@@ -977,18 +977,22 @@ class PyFCSWebApp:
             self.image_windows[window_id] = {"card": card, "path": filename, "title": title}
 
             with card:
-                # Title bar (handle)
-                handle_id = f'{window_id}_handle'
-                with ui.row().classes('w-full items-center justify-between q-pa-sm bg-gray-200').props(f'id={handle_id}'):
-                    ui.label(title).classes('text-sm font-bold')
+                # Title bar
+                with ui.row().classes('w-full items-center justify-between q-pa-sm bg-gray-200'):
+                    # ✅ Handle SOLO en el título (izquierda)
+                    handle_id = f'{window_id}_handle'
+                    ui.label(title).classes('text-sm font-bold select-none').props(f'id={handle_id}')
 
+                    # ✅ Botones fuera del handle (derecha) -> ahora sí reciben click
                     with ui.row().classes('gap-1'):
                         with ui.menu() as m:
                             ui.menu_item('Original Image', on_click=lambda wid=window_id: self.show_original_image(wid))
                             ui.menu_item('Color Mapping', on_click=lambda wid=window_id: self.color_mapping(wid))
                             ui.menu_item('Color Mapping All', on_click=lambda wid=window_id: self.color_mapping_all(wid))
+
                         ui.button(icon='more_vert', on_click=m.open).props('flat dense')
                         ui.button(icon='close', on_click=lambda wid=window_id: self.close_image_window(wid)).props('flat dense')
+
 
                 img = ui.image(filename).classes('w-full h-auto object-contain bg-white q-ma-sm')
                 self.image_windows[window_id]["img"] = img
