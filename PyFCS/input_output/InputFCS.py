@@ -13,7 +13,7 @@ import os
 
 class InputFCS(Input):
 
-    def write_file(self, name, selected_colors_lab, progress_callback=None):
+    def write_file(self, name, selected_colors_lab, progress_callback=None, file_path=None):
         # Step 1 & 2: Create Prototype objects
         prototypes = [
             Prototype(
@@ -32,9 +32,12 @@ class InputFCS(Input):
         voronoi_planes = self.extract_planes_and_vertex(getattr(fuzzy_color_space, "prototypes", []))
         supports_planes = self.extract_planes_and_vertex(getattr(fuzzy_color_space, "supports", []))
 
-        save_path = os.path.join(os.getcwd(), "fuzzy_color_spaces")
-        os.makedirs(save_path, exist_ok=True)
-        file_path = os.path.join(save_path, f"{name}.fcs")
+        if file_path is None:
+            save_path = os.path.join(os.getcwd(), "fuzzy_color_spaces")
+            os.makedirs(save_path, exist_ok=True)
+            file_path = os.path.join(save_path, f"{name}.fcs")
+        else:
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
         # Total Lines for Loading
         total_lines = (
@@ -165,6 +168,8 @@ class InputFCS(Input):
                         s += 3
                     del supports_planes[:s]
                     s = 0
+                    
+        return file_path
 
 
     

@@ -27,6 +27,11 @@ class PyFCSWebApp:
         }
         self.color_checkboxes = {}  # nombre -> checkbox (para select/deselect)
 
+        # estado por imagen 
+        self.MEMBERDEGREE = {}          # colores: color_name -> bool
+        self.MEMBERDEGREE_IMG = {}      # imágenes: window_id -> bool
+        self.ORIGINAL_IMG = {}          # window_id -> bool
+
         # loading UI references
         self.loading_dialog = None
         self.loading_label = None
@@ -49,6 +54,63 @@ class PyFCSWebApp:
         }
         </style>
         ''')
+        ui.add_head_html('''
+        <script>
+        function makeDraggable(boxId, handleId) {
+            const box = document.getElementById(boxId);
+            const handle = document.getElementById(handleId);
+            if (!box || !handle) return;
+
+            box.style.position = 'absolute';
+
+            let startX = 0, startY = 0;
+            let origX = 0, origY = 0;
+            let dragging = false;
+
+            const onPointerDown = (e) => {
+            dragging = true;
+            handle.setPointerCapture(e.pointerId);
+
+            startX = e.clientX;
+            startY = e.clientY;
+
+            const rect = box.getBoundingClientRect();
+            origX = rect.left;
+            origY = rect.top;
+
+            box.style.zIndex = (window.__zCounter = (window.__zCounter || 1000) + 1);
+            e.preventDefault();
+            };
+
+            const onPointerMove = (e) => {
+            if (!dragging) return;
+
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+
+            // Convertimos a coordenadas relativas al contenedor padre (que es relative)
+            const parent = box.parentElement.getBoundingClientRect();
+            const newLeft = (origX + dx) - parent.left;
+            const newTop  = (origY + dy) - parent.top;
+
+            box.style.left = newLeft + 'px';
+            box.style.top  = newTop + 'px';
+            };
+
+            const onPointerUp = (e) => {
+            dragging = false;
+            try { handle.releasePointerCapture(e.pointerId); } catch(_) {}
+            };
+
+            handle.style.cursor = 'move';
+            handle.addEventListener('pointerdown', onPointerDown);
+            handle.addEventListener('pointermove', onPointerMove);
+            handle.addEventListener('pointerup', onPointerUp);
+            handle.addEventListener('pointercancel', onPointerUp);
+        }
+        </script>
+        ''')
+
 
 
         # ---- Header / Menus ----
@@ -95,7 +157,9 @@ class PyFCSWebApp:
             with splitter.before:
                 with ui.card().classes('w-full h-full'):
                     ui.label('Image Display').classes('font-bold')
-                    self.image_view = ui.image('').classes('w-full h-[calc(100%-32px)] object-contain bg-white')
+                    self.image_workspace = ui.element('div').classes(
+                        'relative w-full h-[calc(100%-32px)] bg-white overflow-hidden'
+                    )
 
             # RIGHT: Tabs
             with splitter.after:
@@ -122,7 +186,7 @@ class PyFCSWebApp:
                                 with ui.card().classes('w-full h-full'):
                                     self.plot_container = ui.column().classes('w-full h-full')
                                     with self.plot_container:
-                                        ui.label('3D plot placeholder').classes('text-gray-500')
+                                        ui.label('3D plot').classes('text-gray-500')
 
                             # Right: colors
                             with inner.after:
@@ -183,6 +247,17 @@ class PyFCSWebApp:
                 )
                 self.color_checkboxes[name] = cb
                 self.MEMBERDEGREE[name] = initial
+
+    
+    def list_preset_fcs(self) -> dict:
+        """Return a dict: label -> absolute_path for preset .fcs files shipped with the app."""
+        presets_dir = os.path.abspath(os.path.join(current_dir, '..', '..', 'fuzzy_color_spaces'))
+        if not os.path.isdir(presets_dir):
+            return {}
+
+        files = sorted([f for f in os.listdir(presets_dir) if f.lower().endswith('.fcs')])
+        return {os.path.splitext(f)[0]: os.path.join(presets_dir, f) for f in files}
+
 
 
     def on_color_toggle(self, name: str, value: bool):
@@ -318,11 +393,33 @@ class PyFCSWebApp:
 
 
     def load_color_space(self):
-        """Web: upload .cns/.fcs -> temp file -> reuse FuzzyColorSpaceManager.load_color_file(path)."""
-        with ui.dialog() as d, ui.card().classes('w-[520px]'):
-            ui.label('Load Color Space').classes('text-lg font-bold')
-            ui.label('Upload a .cns or .fcs file.')
+        presets = self.list_preset_fcs()
 
+        with ui.dialog() as d, ui.card().classes('w-[560px]'):
+            ui.label('Load Color Space').classes('text-lg font-bold')
+
+            # --- Presets ---
+            if presets:
+                ui.label('Load a preset (.fcs) from the server:').classes('text-sm text-gray-700')
+                preset_select = ui.select(
+                    options=list(presets.keys()),
+                    value=list(presets.keys())[0],
+                    label='Presets',
+                ).classes('w-full')
+
+                with ui.row().classes('justify-end gap-2'):
+                    ui.button(
+                        'Load preset',
+                        icon='cloud_download',
+                        on_click=lambda: (d.close(), self.load_color_space_from_path(presets[preset_select.value]))
+                    )
+            else:
+                ui.label('No presets found on the server.').classes('text-sm text-gray-500')
+
+            ui.separator()
+
+            # --- Upload ---
+            ui.label('Or upload a .cns/.fcs file:').classes('text-sm text-gray-700')
             ui.upload(
                 label='Choose file',
                 multiple=False,
@@ -333,6 +430,42 @@ class PyFCSWebApp:
             with ui.row().classes('justify-end'):
                 ui.button('Cancel', on_click=d.close).props('flat')
         d.open()
+
+
+    
+    def load_color_space_from_path(self, filepath: str):
+        self.show_loading_color_space()
+        try:
+            data = self.fuzzy_manager.load_color_file(filepath)
+
+            self.file_path = filepath
+            self.file_base_name = os.path.splitext(os.path.basename(filepath))[0]
+            self.file_name.set_value(self.file_base_name)
+
+            if data['type'] == 'cns':
+                self.color_data = data['color_data']
+                self.display_data_window()
+                self.update_volumes()
+
+            elif data['type'] == 'fcs':
+                self.color_data = data['color_data']
+                self.fuzzy_color_space = data['fuzzy_color_space']
+                self.cores = self.fuzzy_color_space.cores
+                self.supports = self.fuzzy_color_space.supports
+                self.prototypes = self.fuzzy_color_space.prototypes
+                self.fuzzy_color_space.precompute_pack()
+
+                self.display_data_window()
+                self.update_prototypes_info()
+
+            ui.notify('Loaded preset successfully')
+
+        except Exception as ex:
+            self.custom_warning('File Error', str(ex))
+        finally:
+            self.hide_loading()
+
+
 
 
 
@@ -533,6 +666,359 @@ class PyFCSWebApp:
 
         # 5) Right panel list matches desktop behaviour
         self.set_color_list(self.color_matrix)
+
+
+
+
+
+    def _palette_toggle(self, name: str, value: bool):
+        if hasattr(self, 'color_checks') and name in self.color_checks:
+            self.color_checks[name]["value"] = value
+
+
+    def palette_based_creation(self):
+        color_space_path = os.path.join(pyfcs_dir, 'fuzzy_color_spaces', 'cns', 'ISCC_NBS_BASIC.cns')
+        colors = UtilsTools.load_color_data(color_space_path)
+
+        self.palette_colors = colors
+        self.color_checks = {}  # name -> {'value': bool, 'lab': ..., 'rgb': ...}
+
+        # ✅ inicial: todo desmarcado
+        for color_name, data in colors.items():
+            self.color_checks[color_name] = {
+                "value": False,          # <-- aquí
+                "lab": data.get("lab"),
+                "rgb": data.get("rgb"),
+            }
+
+        with ui.dialog() as d, ui.card().classes('w-[560px] h-[680px]'):
+            ui.label('Select colors for your Color Space').classes('text-lg font-bold')
+
+            # Guardamos el scroll y un contenedor interno para poder repintar
+            self.palette_dialog = d
+            self.palette_scroll = ui.scroll_area().classes('w-full h-[560px] border rounded q-pa-sm')
+            with self.palette_scroll:
+                self.palette_list_container = ui.column().classes('w-full gap-1')
+
+            # pinta lista inicial
+            self.render_palette_list()
+
+            with ui.row().classes('justify-end gap-2 w-full'):
+                ui.button('Add New Color', icon='add', on_click=self.addColor_create_fcs)
+                ui.button('Create Color Space', icon='save', on_click=self.create_color_space)
+                ui.button('Close', on_click=d.close).props('flat')
+
+        d.open()
+
+
+
+    def render_palette_list(self):
+        """Render the palette list from self.color_checks into the dialog scroll area."""
+        if not hasattr(self, 'palette_list_container'):
+            return
+
+        self.palette_list_container.clear()
+
+        for color_name, data in self.color_checks.items():
+            lab = data.get("lab")
+            rgb = data.get("rgb")
+            checked = bool(data.get("value", False))
+
+            # lab puede ser dict o lista/np.array
+            if isinstance(lab, dict):
+                L, A, B = float(lab["L"]), float(lab["A"]), float(lab["B"])
+            else:
+                arr = np.array(lab, dtype=float).reshape(3,)
+                L, A, B = float(arr[0]), float(arr[1]), float(arr[2])
+
+            # preview color
+            hexcol = None
+            if rgb is not None and hasattr(UtilsTools, "rgb_to_hex"):
+                hexcol = UtilsTools.rgb_to_hex(rgb)
+
+            lab_text = f"L: {L:.1f}, a: {A:.1f}, b: {B:.1f}"
+
+            with self.palette_list_container:
+                with ui.row().classes('w-full items-center justify-between q-pa-xs border-b'):
+                    # cuadrito color
+                    if hexcol:
+                        ui.html(
+                            f'<div style="width:18px;height:18px;border:1px solid #000;'
+                            f'background:{hexcol};border-radius:3px;"></div>',
+                            sanitize=False,
+                        )
+                    else:
+                        ui.label('■').classes('text-gray-500')
+
+                    # nombre + LAB
+                    with ui.column().classes('gap-0'):
+                        ui.label(color_name).classes('text-sm font-medium')
+                        ui.label(lab_text).classes('text-xs text-gray-600')
+
+                    # checkbox (con callback)
+                    ui.checkbox(
+                        '',
+                        value=checked,
+                        on_change=lambda e, n=color_name: self._palette_toggle(n, e.value),
+                    )
+
+
+
+
+    def addColor_create_fcs(self):
+        with ui.dialog() as d, ui.card().classes('w-[420px]'):
+            ui.label('Add New Color').classes('text-lg font-bold')
+            name_in = ui.input(label='Color name').classes('w-full')
+            l_in = ui.number(label='L*', value=50, format='%.2f').classes('w-full')
+            a_in = ui.number(label='a*', value=0, format='%.2f').classes('w-full')
+            b_in = ui.number(label='b*', value=0, format='%.2f').classes('w-full')
+
+            def _add():
+                name = (name_in.value or '').strip()
+                if not name:
+                    self.custom_warning("Warning", "Color name is required.")
+                    return
+                if name in self.color_checks:
+                    self.custom_warning("Warning", "That color name already exists.")
+                    return
+
+                lab = np.array([float(l_in.value), float(a_in.value), float(b_in.value)], dtype=float)
+
+                # opcional: calcula rgb para preview usando tu UtilsTools si existe
+                rgb = None
+                if hasattr(UtilsTools, "lab_to_rgb"):
+                    try:
+                        rgb = UtilsTools.lab_to_rgb({'L': lab[0], 'A': lab[1], 'B': lab[2]})
+                    except Exception:
+                        rgb = None
+
+                self.color_checks[name] = {"value": True, "lab": lab, "rgb": rgb}
+
+                d.close()
+                self.render_palette_list()
+                ui.notify('Color added')
+
+            with ui.row().classes('justify-end gap-2'):
+                ui.button('Cancel', on_click=d.close).props('flat')
+                ui.button('Add', on_click=_add)
+
+        d.open()
+
+
+
+
+
+
+
+
+
+    def create_color_space(self):
+        # Extraer seleccionados en LAB 
+        selected_colors_lab = {}
+        for name, data in (getattr(self, 'color_checks', {}) or {}).items():
+            if data.get("value", False):
+                lab = data.get("lab")
+                if isinstance(lab, dict):
+                    selected_colors_lab[name] = np.array([lab["L"], lab["A"], lab["B"]], dtype=float)
+                else:
+                    selected_colors_lab[name] = np.array(lab, dtype=float)
+
+        if len(selected_colors_lab) < 2:
+            self.custom_warning("Warning", "At least two colors must be selected to create the Color Space.")
+            return
+
+        # pedir nombre en dialog web
+        with ui.dialog() as d, ui.card().classes('w-[420px]'):
+            ui.label('Color Space Name').classes('text-lg font-bold')
+            name_input = ui.input(label='Name for the fuzzy color space').classes('w-full')
+
+            def _ok():
+                cs_name = (name_input.value or '').strip()
+                if not cs_name:
+                    self.custom_warning("Warning", "Please enter a name.")
+                    return
+                d.close()
+                self.save_cs(cs_name, selected_colors_lab)
+
+            with ui.row().classes('justify-end gap-2'):
+                ui.button('Cancel', on_click=d.close).props('flat')
+                ui.button('OK', on_click=_ok)
+
+        d.open()
+
+
+    def save_cs(self, name: str, selected_colors_lab: dict):
+        self.show_loading("Creating .fcs file...")
+
+        tmp_path = None
+        try:
+            # crear temporal
+            tmp_dir = tempfile.mkdtemp(prefix='pyfcs_')
+            tmp_path = os.path.join(tmp_dir, f'{name}.fcs')
+
+            # Reutilizar tu InputFCS.write_file (vía Input.instance('.fcs'))
+            input_fcs = Input.instance('.fcs')
+
+            # NECESITAS que write_file acepte file_path (cambio mínimo recomendado)
+            input_fcs.write_file(name, selected_colors_lab, file_path=tmp_path)
+
+            # descargar al navegador
+            ui.download(tmp_path, filename=f'{name}.fcs')
+
+            ui.notify('Download started')
+
+        except Exception as ex:
+            self.custom_warning("Save Error", str(ex))
+
+        finally:
+            self.hide_loading()
+
+
+
+
+
+
+    # IMAGE MANAGER
+    def list_preset_images(self) -> dict:
+        """Return dict: label -> absolute_path for preset images shipped with the app."""
+        presets_dir = os.path.abspath(os.path.join(current_dir, '..', '..', 'image_test'))
+        if not os.path.isdir(presets_dir):
+            return {}
+
+        exts = ('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp')
+        files = sorted(f for f in os.listdir(presets_dir) if f.lower().endswith(exts))
+        return {os.path.splitext(f)[0]: os.path.join(presets_dir, f) for f in files}
+
+
+    def open_image(self):
+        presets = self.list_preset_images()
+
+        with ui.dialog() as d, ui.card().classes('w-[560px]'):
+            ui.label('Open Image').classes('text-lg font-bold')
+
+            # --- Presets ---
+            if presets:
+                ui.label('Load a preset image from the server:').classes('text-sm text-gray-700')
+                preset_select = ui.select(
+                    options=list(presets.keys()),
+                    value=list(presets.keys())[0],
+                    label='Presets',
+                ).classes('w-full')
+
+                with ui.row().classes('justify-end gap-2'):
+                    ui.button(
+                        'Load preset',
+                        icon='image',
+                        on_click=lambda: (d.close(), self.create_floating_window(presets[preset_select.value], preset_select.value))
+                    )
+            else:
+                ui.label('No preset images found on the server.').classes('text-sm text-gray-500')
+
+            ui.separator()
+
+            # --- Upload ---
+            ui.label('Or upload an image:').classes('text-sm text-gray-700')
+            ui.upload(
+                label='Choose image',
+                multiple=False,
+                auto_upload=True,
+                on_upload=lambda e: self._on_image_uploaded(e, d),
+            ).props('accept=image/*')
+
+            with ui.row().classes('justify-end'):
+                ui.button('Cancel', on_click=d.close).props('flat')
+
+        d.open()
+
+
+
+    async def _on_image_uploaded(self, e, dialog):
+        dialog.close()
+        self.show_loading("Loading image...")
+
+        tmp_path = None
+        try:
+            original_name = e.file.name
+            content_bytes = await e.file.read()
+
+            suffix = os.path.splitext(original_name)[1].lower() or '.png'
+            tmp_dir = tempfile.mkdtemp(prefix='pyfcs_img_')
+            tmp_path = os.path.join(tmp_dir, f'uploaded{suffix}')
+
+            with open(tmp_path, 'wb') as f:
+                f.write(content_bytes)
+
+            self.create_floating_window(tmp_path, display_name=original_name)
+
+        except Exception as ex:
+            self.custom_warning("Image Error", str(ex))
+        finally:
+            self.hide_loading()
+
+
+    def create_floating_window(self, filename: str, display_name: str | None = None):
+        if not hasattr(self, "image_windows"):
+            self.image_windows = {}
+
+        window_id = f"img_{len(self.image_windows) + 1}"
+        title = display_name or os.path.basename(filename)
+
+        self.ORIGINAL_IMG.setdefault(window_id, True)
+        self.MEMBERDEGREE.setdefault(window_id, bool(self.COLOR_SPACE))
+
+        # posición inicial en “cascada”
+        x0 = 20 + 30 * (len(self.image_windows) % 6)
+        y0 = 20 + 30 * (len(self.image_windows) % 6)
+
+        with self.image_workspace:
+            card = ui.card().classes('w-[300px]').props(f'id={window_id}').style(
+                'position:absolute; resize: both; overflow: auto; min-width:220px; min-height:220px;'
+            )
+            self.image_windows[window_id] = {"card": card, "path": filename, "title": title}
+
+            with card:
+                # Title bar (handle)
+                handle_id = f'{window_id}_handle'
+                with ui.row().classes('w-full items-center justify-between q-pa-sm bg-gray-200').props(f'id={handle_id}'):
+                    ui.label(title).classes('text-sm font-bold')
+
+                    with ui.row().classes('gap-1'):
+                        with ui.menu() as m:
+                            ui.menu_item('Original Image', on_click=lambda wid=window_id: self.show_original_image(wid))
+                            ui.menu_item('Color Mapping', on_click=lambda wid=window_id: self.color_mapping(wid))
+                            ui.menu_item('Color Mapping All', on_click=lambda wid=window_id: self.color_mapping_all(wid))
+                        ui.button(icon='more_vert', on_click=m.open).props('flat dense')
+                        ui.button(icon='close', on_click=lambda wid=window_id: self.close_image_window(wid)).props('flat dense')
+
+                img = ui.image(filename).classes('w-full h-auto object-contain bg-white q-ma-sm')
+                self.image_windows[window_id]["img"] = img
+
+        # activar drag (espera a que el DOM exista)
+        ui.timer(0.05, lambda: ui.run_javascript(f"makeDraggable('{window_id}', '{window_id}_handle');"), once=True)
+
+
+
+    def close_image_window(self, window_id: str):
+        win = getattr(self, "image_windows", {}).get(window_id)
+        if not win:
+            return
+        win["card"].delete()  # elimina del DOM
+        del self.image_windows[window_id]
+
+
+
+
+    def show_original_image(self, window_id: str):
+        ui.notify(f'Original Image ({window_id}) (stub)')
+
+    def color_mapping(self, window_id: str):
+        ui.notify(f'Color Mapping ({window_id}) (stub)')
+
+    def color_mapping_all(self, window_id: str):
+        ui.notify(f'Color Mapping All ({window_id}) (stub)')
+
+
+
 
 
 
