@@ -4,6 +4,16 @@ import tempfile
 import sys
 import numpy as np
 from skimage import color as skcolor
+import base64
+import io
+import asyncio
+from PIL import Image
+from nicegui import context
+import matplotlib.pyplot as plt
+import io
+from PIL import Image, ImageDraw, ImageFont
+
+
 
 
 ### current path ###
@@ -26,6 +36,15 @@ class PyFCSWebApp:
             "Support": False,
         }
         self.color_checkboxes = {}  # nombre -> checkbox (para select/deselect)
+        self.modified_image = {}          # window_id -> np.uint8(H,W,3) última imagen recoloreada
+        self.label_map_cache = {}         # window_id -> np.array(H,W) con strings (labels)
+        self.scheme_cache = {}            # window_id -> 'centroid' | 'hsv'
+        self.mapping_all_cache = {}        # (window_id, scheme, max_side) -> data_url
+
+        self.proto_map_cache = {}          # (window_id, proto_label, max_side, scheme) -> (data_url, pct_text)
+        self.proto_membership_cache = {}   # (window_id, proto_label, max_side) -> membership_uint8
+
+
 
         # estado por imagen 
         self.MEMBERDEGREE = {}          # colores: color_name -> bool
@@ -312,10 +331,13 @@ class PyFCSWebApp:
             with self.loading_dialog, ui.card().classes('w-80'):
                 self.loading_label = ui.label(message).classes('text-base font-bold')
                 ui.spinner(size='lg')
-                self.loading_progress = ui.linear_progress(value=0).props('instant-feedback')
+                self.loading_progress = ui.linear_progress(0).props(
+                    'instant-feedback show-value=false indeterminate'
+                )
         else:
             self.loading_label.set_text(message)
             self.loading_progress.set_value(0)
+            self.loading_progress.props('indeterminate')
 
         self.loading_dialog.open()
 
@@ -324,7 +346,9 @@ class PyFCSWebApp:
 
     def set_loading_progress(self, value_0_to_1: float):
         if self.loading_progress is not None:
-            self.loading_progress.set_value(max(0.0, min(1.0, value_0_to_1)))
+            self.loading_progress.props(remove='indeterminate')
+            self.loading_progress.set_value(round(max(0.0, min(1.0, value_0_to_1)), 2))
+
 
     def hide_loading(self):
         if self.loading_dialog is not None:
@@ -957,73 +981,660 @@ class PyFCSWebApp:
 
 
     def create_floating_window(self, filename: str, display_name: str | None = None):
+        """Web 'floating window': a card with title bar + menu + close + image."""
         if not hasattr(self, "image_windows"):
             self.image_windows = {}
+
+        # --- ensure caches exist (so we can clear them on close) ---
+        if not hasattr(self, "label_map_cache"):
+            self.label_map_cache = {}          # (window_id, max_side) -> label_map
+        if not hasattr(self, "mapping_all_cache"):
+            self.mapping_all_cache = {}        # (window_id, scheme, max_side) -> data_url
+        if not hasattr(self, "proto_map_cache"):
+            self.proto_map_cache = {}          # (window_id, chosen, max_side, scheme) -> (data_url, info_text)
+        if not hasattr(self, "proto_membership_cache"):
+            self.proto_membership_cache = {}   # (window_id, chosen, max_side) -> gray_uint8
+        if not hasattr(self, "scheme_cache"):
+            self.scheme_cache = {}             # window_id -> 'centroid' | 'hsv'
 
         window_id = f"img_{len(self.image_windows) + 1}"
         title = display_name or os.path.basename(filename)
 
+        # estado por ventana
+        if not hasattr(self, "ORIGINAL_IMG"):
+            self.ORIGINAL_IMG = {}
         self.ORIGINAL_IMG.setdefault(window_id, True)
-        self.MEMBERDEGREE.setdefault(window_id, bool(self.COLOR_SPACE))
 
-        # posición inicial en “cascada”
+        if hasattr(self, "MEMBERDEGREE_IMG"):
+            self.MEMBERDEGREE_IMG.setdefault(window_id, bool(self.COLOR_SPACE))
+
+        # posición inicial en cascada
         x0 = 20 + 30 * (len(self.image_windows) % 6)
         y0 = 20 + 30 * (len(self.image_windows) % 6)
 
+        # ✅ crea la entrada del dict ANTES de usarla
+        self.image_windows[window_id] = {
+            "path": filename,
+            "title": title,
+            "original_source": filename,
+            "current_source": filename,
+            "card": None,
+            "img": None,
+            "legend_box": None,
+            "legend_title": None,
+            "legend_scroll": None,
+            "legend_info": None,
+            "alt_colors_btn": None,
+            "legend_visible": False,   # ✅ new
+        }
+
         with self.image_workspace:
-            card = ui.card().classes('w-[300px]').props(f'id={window_id}').style(
-                'position:absolute; resize: both; overflow: auto; min-width:220px; min-height:220px;'
+            card = ui.card().classes('w-[320px] max-w-[700px] max-h-[700px]').props(f'id={window_id}').style(
+                f'position:absolute; left:{x0}px; top:{y0}px; resize: both; overflow: auto;'
+                'min-width:220px; min-height:220px;'
             )
-            self.image_windows[window_id] = {"card": card, "path": filename, "title": title}
+            self.image_windows[window_id]["card"] = card
 
             with card:
-                # Title bar
+                # Title bar: handle SOLO en el label
                 with ui.row().classes('w-full items-center justify-between q-pa-sm bg-gray-200'):
-                    # ✅ Handle SOLO en el título (izquierda)
                     handle_id = f'{window_id}_handle'
                     ui.label(title).classes('text-sm font-bold select-none').props(f'id={handle_id}')
 
-                    # ✅ Botones fuera del handle (derecha) -> ahora sí reciben click
                     with ui.row().classes('gap-1'):
+                        # ✅ toggle legend (compact)
+                        ui.button(
+                            icon='info',
+                            on_click=lambda wid=window_id: self.toggle_legend(wid),
+                        ).props('flat dense')
+
                         with ui.menu() as m:
                             ui.menu_item('Original Image', on_click=lambda wid=window_id: self.show_original_image(wid))
                             ui.menu_item('Color Mapping', on_click=lambda wid=window_id: self.color_mapping(wid))
                             ui.menu_item('Color Mapping All', on_click=lambda wid=window_id: self.color_mapping_all(wid))
-
                         ui.button(icon='more_vert', on_click=m.open).props('flat dense')
                         ui.button(icon='close', on_click=lambda wid=window_id: self.close_image_window(wid)).props('flat dense')
 
-
+                # Image (crece con el resize del card)
                 img = ui.image(filename).classes('w-full h-auto object-contain bg-white q-ma-sm')
                 self.image_windows[window_id]["img"] = img
 
-        # activar drag (espera a que el DOM exista)
-        ui.timer(0.05, lambda: ui.run_javascript(f"makeDraggable('{window_id}', '{window_id}_handle');"), once=True)
+                # Legend/controls container (oculto al inicio) ✅ más compacto
+                legend_box = ui.card().classes('w-full q-ma-sm q-pa-sm').style('display:none;')
+                with legend_box:
+                    legend_title = ui.label('Legend').classes('font-bold text-sm')
+                    legend_scroll = ui.scroll_area().classes('w-full h-[110px] q-pa-xs')  # ✅ menos alto
+                    legend_info = ui.label('').classes('text-xs text-gray-600')
 
+                    alt_btn = ui.button(
+                        'Alt. Colors',
+                        on_click=lambda wid=window_id: self.toggle_color_scheme(wid),
+                    ).props('dense')
+
+                self.image_windows[window_id]["legend_box"] = legend_box
+                self.image_windows[window_id]["legend_title"] = legend_title
+                self.image_windows[window_id]["legend_scroll"] = legend_scroll
+                self.image_windows[window_id]["legend_info"] = legend_info
+                self.image_windows[window_id]["alt_colors_btn"] = alt_btn
+
+        # activar drag (espera a que el DOM exista)
+        ui.timer(
+            0.05,
+            lambda: ui.run_javascript(f"makeDraggable('{window_id}', '{window_id}_handle');"),
+            once=True,
+        )
+
+
+    def toggle_legend(self, window_id: str):
+        win = self.image_windows.get(window_id)
+        if not win:
+            return
+        win["legend_visible"] = not win.get("legend_visible", False)
+        box = win.get("legend_box")
+        if box:
+            box.style('display:block;' if win["legend_visible"] else 'display:none;')
 
 
     def close_image_window(self, window_id: str):
         win = getattr(self, "image_windows", {}).get(window_id)
         if not win:
             return
-        win["card"].delete()  # elimina del DOM
+
+        # elimina del DOM
+        if win.get("card") is not None:
+            win["card"].delete()
+
+        # --- limpiar caches relacionadas con esa imagen ---
+        for k in list(getattr(self, "label_map_cache", {}).keys()):
+            if k[0] == window_id:
+                del self.label_map_cache[k]
+
+        for k in list(getattr(self, "mapping_all_cache", {}).keys()):
+            if k[0] == window_id:
+                del self.mapping_all_cache[k]
+
+        for k in list(getattr(self, "proto_map_cache", {}).keys()):
+            if k[0] == window_id:
+                del self.proto_map_cache[k]
+
+        for k in list(getattr(self, "proto_membership_cache", {}).keys()):
+            if k[0] == window_id:
+                del self.proto_membership_cache[k]
+
+        if hasattr(self, "scheme_cache") and window_id in self.scheme_cache:
+            del self.scheme_cache[window_id]
+
+        if hasattr(self, "ORIGINAL_IMG") and window_id in self.ORIGINAL_IMG:
+            del self.ORIGINAL_IMG[window_id]
+
+        if hasattr(self, "MEMBERDEGREE_IMG") and window_id in self.MEMBERDEGREE_IMG:
+            del self.MEMBERDEGREE_IMG[window_id]
+
         del self.image_windows[window_id]
+
+
+    def color_mapping(self, window_id: str):
+        if not getattr(self, 'COLOR_SPACE', False):
+            self.custom_warning("No Color Space", "Load a color space first (.cns or .fcs).")
+            return
+
+        labels = list(getattr(self, 'color_matrix', []) or [])
+        if not labels:
+            self.custom_warning("No Data", "No colors loaded to map.")
+            return
+
+        # --- ensure caches exist ---
+        if not hasattr(self, "proto_map_cache"):
+            self.proto_map_cache = {}
+        if not hasattr(self, "proto_membership_cache"):
+            self.proto_membership_cache = {}
+        if not hasattr(self, "scheme_cache"):
+            self.scheme_cache = {}
+
+        with ui.dialog() as d, ui.card().classes('w-[520px]'):
+            ui.label('Color Mapping (single prototype)').classes('text-lg font-bold')
+            ui.label('Membership map for ONE prototype (grayscale).').classes('text-sm text-gray-600')
+
+            sel = ui.select(options=labels, value=labels[0], label='Prototype').classes('w-full')
+
+            async def _apply():
+                d.close()
+                self.show_loading("Color Mapping...")
+
+                try:
+                    max_side = 400
+
+                    # 1) reduced working image (HxWx3 uint8)
+                    img_np = self._get_work_image_np(window_id, max_side=max_side)
+
+                    chosen = sel.value
+                    scheme = self.scheme_cache.get(window_id, 'centroid')  # no afecta a grayscale, pero lo metemos en cache_key por consistencia
+                    cache_key = (window_id, chosen, max_side, scheme)
+
+                    # ✅ cache final render (instant)
+                    if cache_key in self.proto_map_cache:
+                        data_url, info_text = self.proto_map_cache[cache_key]
+
+                        win = self.image_windows[window_id]
+                        win["img"].set_source(data_url)
+                        win["current_source"] = data_url
+
+                        self._render_legend(
+                            window_id,
+                            only_labels=[chosen],
+                            info=info_text,
+                            mode='single',
+                        )
+                        self.ORIGINAL_IMG[window_id] = True
+                        if hasattr(self, "MEMBERDEGREE"):
+                            self.MEMBERDEGREE[window_id] = False
+                        return
+
+                    # 2) compute membership map ONLY for this prototype (cached)
+                    mkey = (window_id, chosen, max_side)
+                    if mkey in self.proto_membership_cache:
+                        gray = self.proto_membership_cache[mkey]
+                    else:
+                        proto_index = self._proto_index_by_label(chosen)
+                        gray = await asyncio.to_thread(self._membership_map_for_prototype, img_np, proto_index)
+                        self.proto_membership_cache[mkey] = gray
+
+                    # 3) show as grayscale RGB for ui.image
+                    out = np.stack([gray, gray, gray], axis=-1)
+
+                    pct = float((gray > 0).sum()) / float(gray.size) * 100.0
+                    info_text = f'Selected: {chosen} — {pct:.2f}% (nonzero membership)'
+
+                    self.modified_image[window_id] = out
+                    data_url = self._np_to_data_url(out)
+
+                    win = self.image_windows[window_id]
+                    win["img"].set_source(data_url)
+                    win["current_source"] = data_url
+
+                    # 4) legend only chosen, and NO alt colors
+                    self._render_legend(
+                        window_id,
+                        only_labels=[chosen],
+                        info=info_text,
+                        mode='single',
+                    )
+
+                    # ✅ cache final
+                    self.proto_map_cache[cache_key] = (data_url, info_text)
+
+                    self.ORIGINAL_IMG[window_id] = True
+                    if hasattr(self, "MEMBERDEGREE"):
+                        self.MEMBERDEGREE[window_id] = False
+
+                    # (opcional) auto-mostrar legend al aplicar
+                    if not self.image_windows[window_id].get("legend_visible", False):
+                        self.toggle_legend(window_id)
+
+                except Exception as e:
+                    self.custom_warning("Processing Error", str(e))
+                finally:
+                    self.hide_loading()
+
+            with ui.row().classes('justify-end gap-2'):
+                ui.button('Cancel', on_click=d.close).props('flat')
+                ui.button('Apply', icon='palette', on_click=_apply)
+
+        d.open()
+
+
+
+
+
+
+
+
+    def _np_to_data_url(self, arr_uint8: np.ndarray) -> str:
+        """np(H,W,3 uint8) -> data:image/png;base64,..."""
+        im = Image.fromarray(arr_uint8, mode='RGB')
+        buf = io.BytesIO()
+        im.save(buf, format='PNG')
+        b64 = base64.b64encode(buf.getvalue()).decode('ascii')
+        return f'data:image/png;base64,{b64}'
+
+
+    def _label_colors_centroid(self) -> dict:
+        if not hasattr(self, 'color_data') or not self.color_data:
+            return {}
+
+        out = {}
+        for label, v in self.color_data.items():
+            lab = v.get('positive_prototype', None)
+            if lab is None:
+                lab = v.get('Color', None)
+            if lab is None:
+                continue
+
+            lab = np.array(lab, dtype=float).reshape(1, 1, 3)
+            rgb01 = skcolor.lab2rgb(lab)[0, 0]
+            rgb255 = (np.clip(rgb01, 0, 1) * 255).astype(np.uint8)
+            out[label] = rgb255
+        return out
+
+
+
+    def _label_colors_hsv(self) -> dict:
+        """label -> rgb_uint8 using hsv colormap."""
+        labels = list(getattr(self, 'color_matrix', []) or [])
+        if not labels:
+            return {}
+        cmap = plt.get_cmap('hsv', len(labels))
+        out = {}
+        for i, lab in enumerate(labels):
+            rgb01 = np.array(cmap(i)[:3], dtype=float)
+            rgb255 = (np.clip(rgb01, 0, 1) * 255).astype(np.uint8)
+            # mantiene 'black' negro
+            if lab.lower() == 'black':
+                rgb255 = np.array([0, 0, 0], dtype=np.uint8)
+            out[lab] = rgb255
+        return out
+
+
+    def _compute_label_map(self, img_uint8: np.ndarray, progress_callback=None) -> np.ndarray:
+        self.fuzzy_color_space.precompute_pack()
+
+        img01 = img_uint8.astype(np.float32) / 255.0
+        lab_img = skcolor.rgb2lab(img01)
+        lab_q = np.round(lab_img, 2)
+
+        h, w = lab_q.shape[:2]
+        total = h * w
+        label_map = np.empty((h, w), dtype=object)
+
+        membership_cache = {}
+        processed = 0
+
+        for y in range(h):
+            for x in range(w):
+                lab_color = lab_q[y, x]
+                key = (int(lab_color[0] * 100), int(lab_color[1] * 100), int(lab_color[2] * 100))
+
+                best_label = membership_cache.get(key)
+                if best_label is None:
+                    m = self.fuzzy_color_space.calculate_membership(lab_color)
+                    best_label = max(m, key=m.get) if m else None
+                    membership_cache[key] = best_label
+
+                label_map[y, x] = best_label
+                processed += 1
+
+                if progress_callback and (processed % 5000 == 0 or processed == total):
+                    progress_callback(processed, total)
+
+        return label_map
 
 
 
 
     def show_original_image(self, window_id: str):
-        ui.notify(f'Original Image ({window_id}) (stub)')
+        try:
+            win = self.image_windows[window_id]
+            win["img"].set_source(win["original_source"])
+            win["current_source"] = win["original_source"]
 
-    def color_mapping(self, window_id: str):
-        ui.notify(f'Color Mapping ({window_id}) (stub)')
+            # ocultar legend/controles
+            if "legend_box" in win:
+                win["legend_box"].style('display:none;')
+
+            self.ORIGINAL_IMG[window_id] = False
+            ui.notify('Original image restored')
+        except Exception as e:
+            self.custom_warning("Display Error", str(e))
+
 
     def color_mapping_all(self, window_id: str):
-        ui.notify(f'Color Mapping All ({window_id}) (stub)')
+        if not getattr(self, 'COLOR_SPACE', False):
+            self.custom_warning("No Color Space", "Load a color space first (.cns or .fcs).")
+            return
+
+        client = context.client  # ✅ contexto UI del usuario
+
+        async def _run():
+            # todo lo que sea UI debe ir "with client:"
+            with client:
+                self.show_loading("Color Mapping All...")
+
+            try:
+                img_np = self._get_work_image_np(window_id, max_side=400)
+
+                def progress(cur, total):
+                    # ✅ esto también toca UI, así que dentro de client
+                    with client:
+                        self.set_loading_progress(cur / total)
+
+                if window_id not in self.label_map_cache:
+                    label_map = await asyncio.to_thread(self._compute_label_map, img_np, progress)
+                    self.label_map_cache[window_id] = label_map
+                else:
+                    label_map = self.label_map_cache[window_id]
+
+                scheme = self.scheme_cache.get(window_id, 'centroid')
+                colors = self._label_colors_centroid() if scheme == 'centroid' else self._label_colors_hsv()
+
+                h, w = label_map.shape
+                out = np.zeros((h, w, 3), dtype=np.uint8)
+
+                for label, rgb in colors.items():
+                    out[label_map == label] = rgb
+                out[label_map == None] = np.array([0, 0, 0], dtype=np.uint8)
+
+                self.modified_image[window_id] = out
+                data_url = self._np_to_data_url(out)
+
+                with client:
+                    win = self.image_windows[window_id]
+                    win["img"].set_source(data_url)
+                    win["current_source"] = data_url
+                    self._render_legend(window_id)
+                    ui.notify('Color mapping applied (preview)')
+
+            except Exception as e:
+                with client:
+                    self.custom_warning("Processing Error", str(e))
+
+            finally:
+                with client:
+                    self.hide_loading()
+
+        asyncio.create_task(_run())
 
 
 
 
+    def _get_work_image_np(self, window_id: str, max_side: int = 400) -> np.ndarray:
+        path = self.image_windows[window_id]["path"]
+        img = Image.open(path).convert('RGB')
+
+        w, h = img.size
+        if max(w, h) > max_side:
+            scale = max_side / float(max(w, h))
+            img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+
+        return np.array(img, dtype=np.uint8)
+
+
+
+    def _render_legend(self, window_id: str, only_labels=None, info: str | None = None, mode: str = 'all'):
+        win = self.image_windows[window_id]
+
+        legend_box = win.get("legend_box")
+        legend_scroll = win.get("legend_scroll")
+        legend_info = win.get("legend_info")
+        alt_btn = win.get("alt_colors_btn")
+
+        if legend_box is None or legend_scroll is None or legend_info is None:
+            return
+
+        # mostrar panel legend siempre que llamemos
+        legend_box.style('display:block;')
+
+        # show/hide alt button depending on mode
+        if alt_btn is not None:
+            alt_btn.set_visibility(mode == 'all')
+
+        scheme = self.scheme_cache.get(window_id, 'centroid')
+        colors = self._label_colors_centroid() if scheme == 'centroid' else self._label_colors_hsv()
+
+        labels = only_labels if only_labels is not None else list(getattr(self, 'color_matrix', []) or [])
+
+        legend_scroll.clear()
+        with legend_scroll:
+            for lab in labels:
+                rgb = colors.get(lab, np.array([0, 0, 0], dtype=np.uint8))
+                hexcol = f'#{int(rgb[0]):02x}{int(rgb[1]):02x}{int(rgb[2]):02x}'
+                with ui.row().classes('items-center gap-2'):
+                    ui.html(
+                        f'<div style="width:18px;height:18px;border:1px solid #000;background:{hexcol};border-radius:3px;"></div>',
+                        sanitize=False,
+                    )
+                    ui.label(lab).classes('text-sm')
+
+        legend_info.set_text(info or '')
+
+
+
+
+    def toggle_color_scheme(self, window_id: str):
+        current = self.scheme_cache.get(window_id, 'centroid')
+        self.scheme_cache[window_id] = 'hsv' if current == 'centroid' else 'centroid'
+
+        # si ya hay label_map, recolorea sin recalcular
+        if window_id in self.label_map_cache:
+            # reaplica mapping con el nuevo esquema
+            self.color_mapping_all(window_id)
+        else:
+            self._render_legend(window_id)
+
+
+
+
+    def _proto_index_by_label(self, label: str) -> int:
+        for i, p in enumerate(self.prototypes):
+            if getattr(p, 'label', None) == label:
+                return i
+        raise ValueError(f'Prototype not found: {label}')
+
+    def _membership_map_for_prototype(self, img_np_rgb255: np.ndarray, proto_index: int, progress_cb=None) -> np.ndarray:
+        """
+        Returns grayscale membership map uint8 for ONE prototype.
+        img_np_rgb255: HxWx3 uint8 (0..255)
+        """
+        img = img_np_rgb255.astype(np.float32) / 255.0
+        lab = skcolor.rgb2lab(img)
+        lab_q = np.round(lab, 2)  # 0.01 precision
+
+        h, w, _ = lab_q.shape
+        flat = lab_q.reshape(-1, 3)
+
+        total = flat.shape[0]
+        out = np.empty(total, dtype=np.float32)
+
+        cache = {}
+        fcs = self.fuzzy_color_space  # alias
+
+        for i in range(total):
+            L, A, B = flat[i]
+            key = (float(L), float(A), float(B))
+            val = cache.get(key)
+            if val is None:
+                val = fcs.calculate_membership_for_prototype(np.array([L, A, B], dtype=float), proto_index)
+                cache[key] = val
+            out[i] = val
+
+            if progress_cb and (i % 5000 == 0 or i == total - 1):
+                progress_cb(i + 1, total)
+
+        gray = (out.reshape(h, w) * 255.0)
+        gray = np.clip(gray, 0, 255).astype(np.uint8)
+        return gray
+
+
+
+
+
+
+
+
+
+
+    def _compose_with_legend(self, img_uint8: np.ndarray, window_id: str) -> Image.Image:
+        """Return a PIL Image with a legend appended at the bottom."""
+        img = Image.fromarray(img_uint8, mode='RGB')
+        labels = list(getattr(self, 'color_matrix', []) or [])
+
+        scheme = self.scheme_cache.get(window_id, 'centroid')
+        colors = self._label_colors_centroid() if scheme == 'centroid' else self._label_colors_hsv()
+
+        # layout legend
+        pad = 12
+        swatch = 18
+        line_h = 24
+        max_lines = max(1, len(labels))
+
+        legend_h = pad * 2 + line_h * max_lines
+        out = Image.new('RGB', (img.width, img.height + legend_h), (255, 255, 255))
+        out.paste(img, (0, 0))
+
+        draw = ImageDraw.Draw(out)
+
+        # font (safe fallback)
+        try:
+            font = ImageFont.truetype("arial.ttf", 14)
+        except Exception:
+            font = ImageFont.load_default()
+
+        y0 = img.height + pad
+        x0 = pad
+
+        for i, lab in enumerate(labels):
+            rgb = colors.get(lab, np.array([0, 0, 0], dtype=np.uint8))
+            hexcol = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+            y = y0 + i * line_h
+
+            # swatch
+            draw.rectangle([x0, y + 3, x0 + swatch, y + 3 + swatch], fill=hexcol, outline=(0, 0, 0))
+            # text
+            draw.text((x0 + swatch + 10, y + 2), lab, fill=(0, 0, 0), font=font)
+
+        return out
+
+    def save_image(self):
+        # Debe haber al menos 1 ventana con imagen
+        wins = getattr(self, "image_windows", {})
+        if not wins:
+            self.custom_warning("Save Image", "There are no image windows to save.")
+            return
+
+        options = {wid: wins[wid].get("title", wid) for wid in wins.keys()}
+
+        with ui.dialog() as d, ui.card().classes('w-[520px]'):
+            ui.label('Save Image').classes('text-lg font-bold')
+            ui.label('Choose which image you want to download.').classes('text-sm text-gray-600')
+
+            sel = ui.select(
+                options=options,
+                value=list(options.keys())[0],
+                label='Image window',
+            ).classes('w-full')
+
+            include_legend = ui.checkbox('Include legend (if available)', value=True)
+            fmt = ui.select(options=['png', 'jpg'], value='png', label='Format').classes('w-full')
+
+            async def _download():
+                wid = sel.value
+                d.close()
+
+                try:
+                    # Escoge qué datos guardar:
+                    # - si existe modified_image[wid] -> guardamos eso
+                    # - si no, guardamos la original
+                    if hasattr(self, 'modified_image') and wid in self.modified_image:
+                        arr = self.modified_image[wid]
+                        pil = Image.fromarray(arr.astype(np.uint8), mode='RGB')
+                    else:
+                        # original
+                        path = self.image_windows[wid]["path"]
+                        pil = Image.open(path).convert('RGB')
+
+                    # ¿leyenda?
+                    if include_legend.value and hasattr(self, 'label_map_cache') and wid in self.label_map_cache:
+                        # si hemos hecho mapping, entonces sí tiene sentido legend
+                        pil = self._compose_with_legend(np.array(pil, dtype=np.uint8), wid)
+
+                    # encode
+                    buf = io.BytesIO()
+                    if fmt.value == 'jpg':
+                        pil.save(buf, format='JPEG', quality=95)
+                        mime = 'image/jpeg'
+                        ext = 'jpg'
+                    else:
+                        pil.save(buf, format='PNG')
+                        mime = 'image/png'
+                        ext = 'png'
+
+                    data = buf.getvalue()
+
+                    # filename
+                    base = self.image_windows[wid].get("title", wid).replace(' ', '_')
+                    filename = f'{base}.{ext}'
+
+                    # ✅ fuerza descarga en el navegador
+                    ui.download(data, filename=filename, media_type=mime)
+                    ui.notify(f'Downloading: {filename}')
+
+                except Exception as e:
+                    self.custom_warning("Save Error", str(e))
+
+            with ui.row().classes('justify-end gap-2'):
+                ui.button('Cancel', on_click=d.close).props('flat')
+                ui.button('Download', icon='download', on_click=_download)
+
+        d.open()
 
 
 
