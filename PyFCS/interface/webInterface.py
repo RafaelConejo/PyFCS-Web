@@ -73,62 +73,102 @@ class PyFCSWebApp:
         }
         </style>
         ''')
+
         ui.add_head_html('''
         <script>
-        function makeDraggable(boxId, handleId) {
-            const box = document.getElementById(boxId);
+            window.__pyfcsZ = window.__pyfcsZ || 2000;
+
+            function bringToFront(el) {
+            window.__pyfcsZ += 1;
+            el.style.zIndex = window.__pyfcsZ;
+            }
+
+            function makeDraggable(elId, handleId) {
+            const el = document.getElementById(elId);
             const handle = document.getElementById(handleId);
-            if (!box || !handle) return;
+            if (!el || !handle) return;
 
-            box.style.position = 'absolute';
+            // Asegura posicionamiento
+            el.style.position = 'absolute';
+            el.style.willChange = 'left, top';
 
-            let startX = 0, startY = 0;
-            let origX = 0, origY = 0;
-            let dragging = false;
-
-            const onPointerDown = (e) => {
-            dragging = true;
-            handle.setPointerCapture(e.pointerId);
-
-            startX = e.clientX;
-            startY = e.clientY;
-
-            const rect = box.getBoundingClientRect();
-            origX = rect.left;
-            origY = rect.top;
-
-            box.style.zIndex = (window.__zCounter = (window.__zCounter || 1000) + 1);
-            e.preventDefault();
-            };
-
-            const onPointerMove = (e) => {
-            if (!dragging) return;
-
-            const dx = e.clientX - startX;
-            const dy = e.clientY - startY;
-
-            // Convertimos a coordenadas relativas al contenedor padre (que es relative)
-            const parent = box.parentElement.getBoundingClientRect();
-            const newLeft = (origX + dx) - parent.left;
-            const newTop  = (origY + dy) - parent.top;
-
-            box.style.left = newLeft + 'px';
-            box.style.top  = newTop + 'px';
-            };
-
-            const onPointerUp = (e) => {
-            dragging = false;
-            try { handle.releasePointerCapture(e.pointerId); } catch(_) {}
-            };
-
+            // Evita scroll/touch gestures durante drag
             handle.style.cursor = 'move';
-            handle.addEventListener('pointerdown', onPointerDown);
-            handle.addEventListener('pointermove', onPointerMove);
-            handle.addEventListener('pointerup', onPointerUp);
-            handle.addEventListener('pointercancel', onPointerUp);
-        }
-        </script>
+            handle.style.userSelect = 'none';
+            handle.style.touchAction = 'none';
+
+            let dragging = false;
+            let startX = 0, startY = 0;
+            let startLeft = 0, startTop = 0;
+
+            // RAF para suavidad
+            let raf = 0;
+            let nextLeft = 0, nextTop = 0;
+
+            function applyPos() {
+                raf = 0;
+                el.style.left = nextLeft + 'px';
+                el.style.top  = nextTop  + 'px';
+            }
+
+            function onMove(e) {
+                if (!dragging) return;
+
+                const dx = e.clientX - startX;
+                const dy = e.clientY - startY;
+
+                nextLeft = startLeft + dx;
+                nextTop  = startTop  + dy;
+
+                if (!raf) raf = requestAnimationFrame(applyPos);
+                e.preventDefault();
+            }
+
+            function onUp(e) {
+                if (!dragging) return;
+                dragging = false;
+
+                window.removeEventListener('pointermove', onMove, true);
+                window.removeEventListener('pointerup', onUp, true);
+
+                try { el.releasePointerCapture(e.pointerId); } catch {}
+                e.preventDefault();
+            }
+
+            handle.addEventListener('pointerdown', (e) => {
+                // SOLO botón izquierdo y SOLO si pinchas el handle (no menu)
+                if (e.button !== 0) return;
+
+                dragging = true;
+                bringToFront(el);
+
+                // offsetLeft/Top => sin saltos raros por rect/scroll
+                startLeft = el.offsetLeft;
+                startTop  = el.offsetTop;
+
+                startX = e.clientX;
+                startY = e.clientY;
+
+                // Captura para no perder el drag
+                try { el.setPointerCapture(e.pointerId); } catch {}
+
+                // Escuchamos en window para ir fino incluso si sales del handle
+                window.addEventListener('pointermove', onMove, true);
+                window.addEventListener('pointerup', onUp, true);
+
+                e.preventDefault();
+                e.stopPropagation();
+            });
+
+            // Click normal en la ventana -> al frente (sin mover)
+            el.addEventListener('mousedown', () => bringToFront(el), {passive: true});
+            }
+            </script>
+
         ''')
+
+
+
 
 
 
@@ -1025,33 +1065,29 @@ class PyFCSWebApp:
             "legend_scroll": None,
             "legend_info": None,
             "alt_colors_btn": None,
-            "legend_visible": False,   # ✅ new
+            "legend_visible": False,
         }
 
         with self.image_workspace:
             card = ui.card().classes('w-[320px] max-w-[700px] max-h-[700px]').props(f'id={window_id}').style(
-                f'position:absolute; left:{x0}px; top:{y0}px; resize: both; overflow: auto;'
+                f'position:absolute; left:{x0}px; top:{y0}px; z-index:2000; resize: both; overflow: auto;'
                 'min-width:220px; min-height:220px;'
             )
             self.image_windows[window_id]["card"] = card
 
             with card:
-                # Title bar: handle SOLO en el label
+                # ✅ UNA sola title bar (sin duplicar)
+                handle_id = f'{window_id}_handle'
                 with ui.row().classes('w-full items-center justify-between q-pa-sm bg-gray-200'):
-                    handle_id = f'{window_id}_handle'
                     ui.label(title).classes('text-sm font-bold select-none').props(f'id={handle_id}')
 
                     with ui.row().classes('gap-1'):
-                        # ✅ toggle legend (compact)
-                        ui.button(
-                            icon='info',
-                            on_click=lambda wid=window_id: self.toggle_legend(wid),
-                        ).props('flat dense')
-
                         with ui.menu() as m:
                             ui.menu_item('Original Image', on_click=lambda wid=window_id: self.show_original_image(wid))
                             ui.menu_item('Color Mapping', on_click=lambda wid=window_id: self.color_mapping(wid))
                             ui.menu_item('Color Mapping All', on_click=lambda wid=window_id: self.color_mapping_all(wid))
+                            # ✅ sin Toggle Legend (como querías)
+
                         ui.button(icon='more_vert', on_click=m.open).props('flat dense')
                         ui.button(icon='close', on_click=lambda wid=window_id: self.close_image_window(wid)).props('flat dense')
 
@@ -1063,7 +1099,7 @@ class PyFCSWebApp:
                 legend_box = ui.card().classes('w-full q-ma-sm q-pa-sm').style('display:none;')
                 with legend_box:
                     legend_title = ui.label('Legend').classes('font-bold text-sm')
-                    legend_scroll = ui.scroll_area().classes('w-full h-[110px] q-pa-xs')  # ✅ menos alto
+                    legend_scroll = ui.scroll_area().classes('w-full h-[110px] q-pa-xs')
                     legend_info = ui.label('').classes('text-xs text-gray-600')
 
                     alt_btn = ui.button(
@@ -1083,6 +1119,7 @@ class PyFCSWebApp:
             lambda: ui.run_javascript(f"makeDraggable('{window_id}', '{window_id}_handle');"),
             once=True,
         )
+
 
 
     def toggle_legend(self, window_id: str):
