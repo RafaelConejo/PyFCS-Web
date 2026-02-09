@@ -1,20 +1,16 @@
 import os
-from nicegui import ui
-import tempfile
-import sys
-import numpy as np
-from skimage import color as skcolor
-import base64
 import io
+import sys
+import base64
 import asyncio
-from PIL import Image
+import tempfile
+import mimetypes
+import numpy as np
+from nicegui import ui
 from nicegui import context
 import matplotlib.pyplot as plt
-import io
+from skimage import color as skcolor
 from PIL import Image, ImageDraw, ImageFont
-
-
-
 
 ### current path ###
 current_dir = os.path.dirname(__file__)
@@ -23,7 +19,7 @@ pyfcs_dir = os.path.abspath(os.path.join(current_dir, '..', '..'))
 # Add the PyFCS path to sys.path
 sys.path.append(pyfcs_dir)
 
-from PyFCS import Input, VisualManager, ReferenceDomain, FuzzyColorSpace, FuzzyColorSpaceManager, ColorEvaluationManager
+from PyFCS import Input, VisualManager, ReferenceDomain, FuzzyColorSpace, FuzzyColorSpaceManager
 import PyFCS.interface.modules.UtilsTools as UtilsTools
 
 class PyFCSWebApp:
@@ -63,6 +59,8 @@ class PyFCSWebApp:
 
     def build_layout(self):
         ui.page_title('PyFCS Interface (Web)')
+
+        ui.colors(primary='#8b5cf6')  
 
         ui.add_head_html('''
         <style>
@@ -164,8 +162,50 @@ class PyFCSWebApp:
             el.addEventListener('mousedown', () => bringToFront(el), {passive: true});
             }
             </script>
-
         ''')
+
+        ui.add_head_html('''
+        <script>
+            window.registerPixelPicker = function(imgId){
+            const img = document.getElementById(imgId);
+            if (!img) return;
+
+            // evitar duplicar listeners si recargas imagen
+            img._pickerRegistered = true;
+
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+            function syncCanvas() {
+                if (!img.naturalWidth || !img.naturalHeight) return;
+                canvas.width = img.naturalWidth;
+                canvas.height = img.naturalHeight;
+                ctx.drawImage(img, 0, 0);
+            }
+
+            if (img.complete) syncCanvas();
+            img.addEventListener('load', syncCanvas);
+
+            img.style.cursor = 'crosshair';
+
+            img.onclick = (ev) => {
+                // asegurarnos que el canvas esté sincronizado
+                syncCanvas();
+
+                const rect = img.getBoundingClientRect();
+                const x = Math.floor((ev.clientX - rect.left) * img.naturalWidth / rect.width);
+                const y = Math.floor((ev.clientY - rect.top) * img.naturalHeight / rect.height);
+
+                const data = ctx.getImageData(x, y, 1, 1).data;
+                const payload = { r: data[0], g: data[1], b: data[2], x, y };
+
+                // ✅ Este helper existe en NiceGUI para mandar eventos al backend
+                emitEvent(img, 'pick', payload);
+            };
+            }
+        </script>
+        ''')
+
 
 
 
@@ -262,7 +302,7 @@ class PyFCSWebApp:
                     with ui.tab_panel(data_tab).classes('w-full h-full'):
                         with ui.card().classes('w-full q-pa-md'):
                             ui.label('Name:').classes('font-bold')
-                            self.file_name = ui.input(placeholder='').classes('w-80')
+                            self.file_name = ui.input(placeholder='').classes('w-80').props('readonly')
 
                         self.data_table = ui.table(
                             columns=[
@@ -270,14 +310,24 @@ class PyFCSWebApp:
                                 {'name': 'L', 'label': 'L*', 'field': 'L'},
                                 {'name': 'a', 'label': 'a*', 'field': 'a'},
                                 {'name': 'b', 'label': 'b*', 'field': 'b'},
+                                {'name': 'color', 'label': 'Color', 'field': 'color', 'sortable': False, 'align': 'center'},
                             ],
                             rows=[],
                             row_key='name',
                         ).classes('w-full')
 
-                        with ui.row().classes('q-pa-md gap-2'):
-                            ui.button('Add New Color', on_click=self.addColor_data_window)
-                            ui.button('Apply Changes', on_click=self.apply_changes)
+                        self.data_table.add_slot('body-cell-color', r'''
+                            <q-td :props="props">
+                            <div style="width:110px;height:24px;border:1px solid #000;margin:auto;border-radius:4px;"
+                                :style="{ background: props.value }">
+                            </div>
+                            </q-td>
+                        ''')
+
+
+                        # with ui.row().classes('q-pa-md gap-2'):
+                        #     ui.button('Add New Color', on_click=self.addColor_data_window)
+                        #     ui.button('Apply Changes', on_click=self.apply_changes)
 
 
 
@@ -418,15 +468,16 @@ class PyFCSWebApp:
         d.open()
 
     def show_menu_create_fcs(self):
-        with ui.dialog() as d, ui.card():
-            ui.label('Create New Color Space').classes('text-lg font-bold')
-            ui.label('Choose a creation mode:')
-            with ui.row().classes('gap-2'):
-                ui.button('Palette-Based', on_click=lambda: (d.close(), self.palette_based_creation()))
-                ui.button('Image-Based', on_click=lambda: (d.close(), self.image_based_creation()))
-            with ui.row().classes('justify-end'):
-                ui.button('Cancel', on_click=d.close).props('flat')
-        d.open()
+        self.palette_based_creation()
+        # with ui.dialog() as d, ui.card():
+        #     ui.label('Create New Color Space').classes('text-lg font-bold')
+        #     ui.label('Choose a creation mode:')
+        #     with ui.row().classes('gap-2'):
+        #         ui.button('Palette-Based', on_click=lambda: (d.close(), self.palette_based_creation()))
+        #         ui.button('Image-Based', on_click=lambda: (d.close(), self.image_based_creation()))
+        #     with ui.row().classes('justify-end'):
+        #         ui.button('Cancel', on_click=d.close).props('flat')
+        # d.open()
 
     # ----- still-stubs (we'll implement next) -----
     def open_image(self): ui.notify('Open Image (stub)')
@@ -665,6 +716,11 @@ class PyFCSWebApp:
 
 
 
+
+
+
+
+
     def display_data_window(self):
         """
         WEB version of display_data_window:
@@ -695,8 +751,16 @@ class PyFCSWebApp:
             self.color_matrix.append(color_name)
 
             # LAB -> RGB -> HEX (like desktop)
-            rgb01 = skcolor.lab2rgb(lab.reshape(1, 1, 3))[0, 0, :]   # values 0..1
-            rgb255 = tuple(int(max(0, min(1, c)) * 255) for c in rgb01)
+            rgb01 = skcolor.lab2rgb(lab.reshape(1, 1, 3))[0, 0, :]
+
+            # ✅ si hay NaN por LAB inválido, fuerza a negro (o pon un fallback)
+            if not np.all(np.isfinite(rgb01)):
+                rgb01 = np.array([0.0, 0.0, 0.0])
+
+            # ✅ clip bien y redondea (no truncar)
+            rgb01 = np.clip(rgb01, 0.0, 1.0)
+            rgb255 = tuple(int(round(c * 255.0)) for c in rgb01)
+
             hex_color = f'#{rgb255[0]:02x}{rgb255[1]:02x}{rgb255[2]:02x}'
             self.hex_color[hex_color] = lab
 
@@ -713,23 +777,21 @@ class PyFCSWebApp:
                 'a': round(float(lab[1]), 2),
                 'b': round(float(lab[2]), 2),
                 'name': color_name,
-                'color': preview,
+                'color': hex_color,   # ✅ solo el hex
             })
 
-        # 4) Push to table + refresh
-        # IMPORTANT: we add/ensure the 'color' column exists and uses html format
-        self.data_table.columns = [
-            {'name': 'L', 'label': 'L*', 'field': 'L'},
-            {'name': 'a', 'label': 'a*', 'field': 'a'},
-            {'name': 'b', 'label': 'b*', 'field': 'b'},
-            {'name': 'name', 'label': 'Name', 'field': 'name'},
-            {'name': 'color', 'label': 'Color', 'field': 'color', 'html': True},
-        ]
         self.data_table.rows = rows
         self.data_table.update()
 
         # 5) Right panel list matches desktop behaviour
         self.set_color_list(self.color_matrix)
+
+
+
+
+
+
+
 
 
 
@@ -766,12 +828,13 @@ class PyFCSWebApp:
 
             # pinta lista inicial
             self.render_palette_list()
+            ui.separator().classes('my-2')
 
-            with ui.row().classes('justify-end gap-2 w-full'):
-                ui.button('Add New Color', icon='add', on_click=self.addColor_create_fcs)
-                ui.button('Create Color Space', icon='save', on_click=self.create_color_space)
+            with ui.row().classes('w-full justify-center items-center gap-3 pt-2'):
+                ui.button('Pick from Image', icon='colorize', on_click=self.open_palette_image_picker).props('unelevated')
+                ui.button('Add New Color', icon='add', on_click=self.addColor_create_fcs).props('unelevated')
+                ui.button('Create Color Space', icon='save', on_click=self.create_color_space).props('unelevated')
                 ui.button('Close', on_click=d.close).props('flat')
-
         d.open()
 
 
@@ -825,6 +888,203 @@ class PyFCSWebApp:
                         value=checked,
                         on_change=lambda e, n=color_name: self._palette_toggle(n, e.value),
                     )
+
+
+
+    def open_palette_image_picker(self):
+        """Open a dialog to pick a color from one of the loaded images."""
+        # Necesitamos imágenes cargadas
+        if not hasattr(self, "image_windows") or not self.image_windows:
+            self.custom_warning("No images", "Open an image first (Image Manager → Open Image).")
+            return
+
+        # Opciones: título visible -> window_id
+        options = {win.get("title", wid): wid for wid, win in self.image_windows.items()}
+        first_label = next(iter(options.keys()))
+        first_wid = options[first_label]
+
+        # Estado picker
+        self._picker_pil_full = None
+        self._picker_selected_wid = first_wid
+        self._picked_rgb = None
+        self._picked_lab = None
+        self._picker_current_source = None  # ✅ new
+
+        with ui.dialog() as d, ui.card().classes('w-[980px] max-w-[98vw]'):
+            ui.label('Pick Color from Image').classes('text-lg font-bold')
+
+            # ✅ Layout: izquierda controles, derecha imagen (más estético)
+            with ui.row().classes('w-full gap-6 items-start'):
+                # LEFT: selector + info
+                with ui.column().classes('w-[320px]'):
+                    sel = ui.select(
+                        options=list(options.keys()),
+                        value=first_label,
+                        label='Loaded Images',
+                        on_change=lambda e: self._picker_load_image(options[e.value]),
+                    ).classes('w-full')
+
+                    ui.separator()
+                    ui.label('Color name:').classes('text-sm text-gray-700')
+                    self._picker_name_input = ui.input(placeholder='e.g. MyColor').classes('w-full')
+
+                    ui.separator()
+                    self._picker_rgb_label = ui.label('RGB: -').classes('text-sm')
+                    self._picker_lab_label = ui.label('LAB: -').classes('text-sm')
+
+                    self._picker_preview = ui.element('div').style(
+                        'width:80px; height:26px; border:1px solid #000; '
+                        'border-radius:4px; background:#000'
+                    )
+
+                    ui.button(
+                        'Add Selected Color',
+                        icon='add',
+                        on_click=lambda: self._picker_add_selected_color(),
+                    ).classes('w-full')
+
+                    with ui.row().classes('justify-end w-full'):
+                        ui.button('Close', on_click=d.close).props('flat')
+
+                # RIGHT: viewer (clicable)
+                with ui.column().classes('flex-1'):
+                    ui.label('Click on the image to pick a pixel').classes('text-sm text-gray-600')
+
+                    # Contenedor para re-render del visor
+                    self._picker_view_container = ui.column().classes('w-full')
+                    with self._picker_view_container:
+                        ui.label('Select an image on the left').classes('text-gray-500')
+
+        d.open()
+        # carga inicial
+        self._picker_load_image(first_wid)
+
+
+    def _source_to_pil(self, src: str) -> Image.Image:
+        """Support both filesystem paths and data URLs."""
+        if isinstance(src, str) and src.startswith('data:image'):
+            header, b64data = src.split(',', 1)
+            raw = base64.b64decode(b64data)
+            return Image.open(io.BytesIO(raw))
+        return Image.open(src)
+    
+
+    def _file_to_data_url(self, path: str) -> str:
+        mime, _ = mimetypes.guess_type(path)
+        if not mime:
+            mime = "image/png"
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:{mime};base64,{b64}"
+
+
+
+    def _picker_load_image(self, window_id: str):
+        if window_id not in self.image_windows:
+            return
+
+        win = self.image_windows[window_id]
+        src = win.get("current_source") or win.get("path")
+        if not src:
+            self.custom_warning("Image Error", "Selected image has no source.")
+            return
+
+        self._picker_selected_wid = window_id
+
+        # PIL (para leer el pixel)
+        pil = self._source_to_pil(src).convert("RGB")
+        self._picker_pil_full = pil
+
+        # src para mostrar (data url si hace falta)
+        if isinstance(src, str) and (not src.startswith("data:image")):
+            if not os.path.exists(src):
+                self.custom_warning("Image Error", "Selected image path not found on server.")
+                return
+            view_src = self._file_to_data_url(src)
+        else:
+            view_src = src
+
+        self._picker_view_container.clear()
+        with self._picker_view_container:
+            # ✅ componente correcto para clicks + coordenadas
+            self._picker_img = ui.interactive_image(
+                view_src,
+                on_mouse=self._picker_on_mouse,
+            ).classes('w-full')
+
+
+
+    def _picker_on_mouse(self, e):
+        # Nos interesa el click (mousedown también funciona según versión)
+        if e.type not in ('click', 'mousedown'):
+            return
+
+        if self._picker_pil_full is None:
+            return
+
+        # interactive_image suele dar coords en la imagen:
+        # e.image_x, e.image_y (si tu versión usa otro nombre, mira print(e))
+        ix = int(getattr(e, 'image_x', -1))
+        iy = int(getattr(e, 'image_y', -1))
+
+        if ix < 0 or iy < 0:
+            # debug por si tu versión usa otros campos
+            print("EVENT:", e)
+            return
+
+        w, h = self._picker_pil_full.size
+        ix = max(0, min(w - 1, ix))
+        iy = max(0, min(h - 1, iy))
+
+        r, g, b = self._picker_pil_full.getpixel((ix, iy))
+
+        lab = UtilsTools.srgb_to_lab(r, g, b)
+        self._picked_rgb = (r, g, b)
+        self._picked_lab = lab
+
+        self._picker_rgb_label.set_text(f"RGB: ({r}, {g}, {b})")
+        self._picker_lab_label.set_text(f"LAB: ({lab[0]:.2f}, {lab[1]:.2f}, {lab[2]:.2f})")
+
+        hex_color = f"#{r:02x}{g:02x}{b:02x}"
+        self._picker_preview.style(f'background:{hex_color}')
+
+
+
+
+    def _picker_add_selected_color(self):
+        """Add the currently picked color into the palette list and repaint."""
+        if self._picked_lab is None or self._picked_rgb is None:
+            self.custom_warning("Pick a color", "Click on the image first to pick a pixel.")
+            return
+
+        name = (self._picker_name_input.value or "").strip()
+        if not name:
+            self.custom_warning("Name required", "Please enter a name for the selected color.")
+            return
+
+        # evitar colisiones
+        base = name
+        i = 2
+        while name in self.palette_colors:
+            name = f"{base}_{i}"
+            i += 1
+
+        lab_dict = {"L": float(self._picked_lab[0]), "A": float(self._picked_lab[1]), "B": float(self._picked_lab[2])}
+        rgb = self._picked_rgb
+
+        # persistimos en el dict base (como si fuese otro color de la paleta)
+        self.palette_colors[name] = {"lab": lab_dict, "rgb": rgb, "source_image": self._picker_selected_wid}
+
+        # también en checks (por defecto desmarcado)
+        self.color_checks[name] = {"value": False, "lab": lab_dict, "rgb": rgb}
+
+        # repinta la lista de la paleta
+        self.render_palette_list()
+
+        # limpia nombre para el siguiente
+        self._picker_name_input.set_value("")
+        ui.notify(f'Added color: {name}')
+
 
 
 
