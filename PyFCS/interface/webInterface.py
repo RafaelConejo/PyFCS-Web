@@ -1799,12 +1799,15 @@ class PyFCSWebApp:
             "current_source": filename,
             "card": None,
             "img": None,
+            "img_container": None,
             "legend_box": None,
             "legend_title": None,
             "legend_scroll": None,
             "legend_info": None,
             "alt_colors_btn": None,
             "legend_visible": False,
+            "width": 320,
+            "height": 320,
         }
 
         # Render the floating card inside the image workspace container
@@ -1838,7 +1841,7 @@ class PyFCSWebApp:
                 self.image_windows[window_id]["img"] = img
 
                 # Legend container (hidden by default)
-                legend_box = ui.card().classes('w-full q-ma-sm q-pa-sm').style('display:none;')
+                legend_box = ui.card().classes('w-full q-ma-sm q-pa-sm shrink-0').style('display:none;')
                 with legend_box:
                     legend_title = ui.label('Legend').classes('font-bold text-sm')
                     legend_scroll = ui.scroll_area().classes('w-full h-[110px] q-pa-xs')
@@ -1860,7 +1863,10 @@ class PyFCSWebApp:
         # Enable drag behavior once the DOM is ready
         ui.timer(
             0.05,
-            lambda: ui.run_javascript(f"makeDraggable('{window_id}', '{window_id}_handle');"),
+            lambda wid=window_id: (
+                ui.run_javascript(f"makeDraggable('{wid}', '{wid}_handle');"),
+                self._install_resize_observer(wid),
+            ),
             once=True,
         )
 
@@ -1934,8 +1940,66 @@ class PyFCSWebApp:
         del self.image_windows[window_id]
 
 
+    def _install_resize_observer(self, window_id: str):
+        ui.run_javascript(f"""
+            (() => {{
+                const el = document.getElementById("{window_id}");
+                if (!el) return;
 
+                if (el._pyfcsResizeObserverInstalled) return;
+                el._pyfcsResizeObserverInstalled = true;
 
+                const observer = new ResizeObserver(entries => {{
+                    const r = entries[0].contentRect;
+                    window.pyfcsWindowSizes = window.pyfcsWindowSizes || {{}};
+                    window.pyfcsWindowSizes["{window_id}"] = {{
+                        width: Math.round(r.width),
+                        height: Math.round(r.height),
+                    }};
+                }});
+
+                observer.observe(el);
+            }})();
+        """)
+
+    async def _remember_window_size(self, window_id: str):
+        size = await ui.run_javascript(f"""
+            (() => {{
+                const el = document.getElementById("{window_id}");
+                if (!el) return null;
+
+                const stored = window.pyfcsWindowSizes && window.pyfcsWindowSizes["{window_id}"];
+                if (stored) return stored;
+
+                const r = el.getBoundingClientRect();
+                return {{ width: Math.round(r.width), height: Math.round(r.height) }};
+            }})()
+        """)
+
+        if size:
+            self.image_windows[window_id]["width"] = int(size["width"])
+            self.image_windows[window_id]["height"] = int(size["height"])
+
+    async def _apply_window_size(self, window_id: str):
+        win = self.image_windows.get(window_id)
+        if not win:
+            return
+
+        w = int(win.get("width", 320))
+        h = int(win.get("height", 320))
+
+        await ui.run_javascript(f"""
+            (() => {{
+                const el = document.getElementById("{window_id}");
+                if (!el) return;
+                el.style.width = "{w}px";
+                el.style.height = "{h}px";
+            }})()
+        """)
+
+    async def _preserve_window_size(self, window_id: str):
+        await self._remember_window_size(window_id)
+        await self._apply_window_size(window_id)
 
 
 
@@ -2006,6 +2070,8 @@ class PyFCSWebApp:
                 d.close()
                 self.show_loading("Color Mapping...")
 
+                await self._remember_window_size(window_id)
+
                 try:
                     max_side = 400
 
@@ -2025,6 +2091,9 @@ class PyFCSWebApp:
                         win = self.image_windows[window_id]
                         win["img"].set_source(data_url)
                         win["current_source"] = data_url
+
+                        await asyncio.sleep(0)
+                        await self._apply_window_size(window_id)
 
                         self._render_legend(
                             window_id,
@@ -2247,7 +2316,7 @@ class PyFCSWebApp:
 
         return label_map
 
-    def show_original_image(self, window_id: str):
+    async def show_original_image(self, window_id: str):
         """
         Restore and display the original image in the floating window.
 
@@ -2257,13 +2326,17 @@ class PyFCSWebApp:
         - Updates ORIGINAL_IMG state flag
         """
         try:
+            await self._remember_window_size(window_id)
+
             win = self.image_windows[window_id]
             win["img"].set_source(win["original_source"])
             win["current_source"] = win["original_source"]
 
-            # Hide legend/controls
             if "legend_box" in win:
                 win["legend_box"].style('display:none;')
+
+            await asyncio.sleep(0)
+            await self._apply_window_size(window_id)
 
             self.ORIGINAL_IMG[window_id] = False
             ui.notify('Original image restored')
@@ -2338,11 +2411,18 @@ class PyFCSWebApp:
                 self.modified_image[window_id] = out
                 data_url = self._np_to_data_url(out)
 
+                await self._remember_window_size(window_id)
+
                 with client:
                     win = self.image_windows[window_id]
                     win["img"].set_source(data_url)
                     win["current_source"] = data_url
                     self._render_legend(window_id)
+                    ui.notify('Color mapping applied (preview)')
+                
+                await asyncio.sleep(0)
+                with client:
+                    await self._apply_window_size(window_id)
                     ui.notify('Color mapping applied (preview)')
 
             except Exception as e:
