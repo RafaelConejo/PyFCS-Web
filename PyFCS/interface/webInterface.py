@@ -12,6 +12,9 @@ import matplotlib.pyplot as plt
 from skimage import color as skcolor
 from PIL import Image, ImageDraw, ImageFont
 
+import hashlib
+import time
+
 ### current path ###
 current_dir = os.path.dirname(__file__)
 pyfcs_dir = os.path.abspath(os.path.join(current_dir, '..', '..'))
@@ -41,6 +44,12 @@ class PyFCSWebApp:
     def __init__(self):
         # Flag indicating whether a color space is currently loaded/active
         self.COLOR_SPACE = False
+
+        # Lower value = faster mapping.
+        self.PREVIEW_MAX_SIDE = 256
+
+        # LAB quantization step for web preview.
+        self.LAB_QUANT_STEP = 0.05
 
         # 3D model display options (what to plot / show)
         self.model_3d_options = {
@@ -112,91 +121,144 @@ class PyFCSWebApp:
             window.__pyfcsZ = window.__pyfcsZ || 2000;
 
             function bringToFront(el) {
-            window.__pyfcsZ += 1;
-            el.style.zIndex = window.__pyfcsZ;
+                window.__pyfcsZ += 2;
+                el.style.zIndex = window.__pyfcsZ;
+
+                // If this image window has a linked legend window, keep it above the image
+                const legend = document.getElementById(el.id + '_legend');
+                if (legend) {
+                    legend.style.zIndex = window.__pyfcsZ + 1;
+                }
             }
 
             function makeDraggable(elId, handleId) {
-            const el = document.getElementById(elId);
-            const handle = document.getElementById(handleId);
-            if (!el || !handle) return;
+                const el = document.getElementById(elId);
+                const handle = document.getElementById(handleId);
+                if (!el || !handle) return;
 
-            // Ensure absolute positioning for drag
-            el.style.position = 'absolute';
-            el.style.willChange = 'left, top';
+                if (el._pyfcsDragInstalled) return;
+                el._pyfcsDragInstalled = true;
 
-            // Prevent scroll/touch gestures while dragging
-            handle.style.cursor = 'move';
-            handle.style.userSelect = 'none';
-            handle.style.touchAction = 'none';
+                el.style.position = 'absolute';
+                el.style.willChange = 'left, top';
+                el.style.transform = 'none';
 
-            let dragging = false;
-            let startX = 0, startY = 0;
-            let startLeft = 0, startTop = 0;
+                handle.style.cursor = 'move';
+                handle.style.userSelect = 'none';
+                handle.style.touchAction = 'none';
 
-            // RAF for smooth updates
-            let raf = 0;
-            let nextLeft = 0, nextTop = 0;
+                // Source of truth for position
+                if (!el.dataset.x) el.dataset.x = String(el.offsetLeft || 0);
+                if (!el.dataset.y) el.dataset.y = String(el.offsetTop || 0);
 
-            function applyPos() {
-                raf = 0;
-                el.style.left = nextLeft + 'px';
-                el.style.top  = nextTop  + 'px';
+                function applyStoredPosition() {
+                    const x = parseFloat(el.dataset.x || '0');
+                    const y = parseFloat(el.dataset.y || '0');
+                    el.style.left = x + 'px';
+                    el.style.top = y + 'px';
+                    el.style.transform = 'none';
+                }
+
+                let dragging = false;
+                let startX = 0, startY = 0;
+                let startLeft = 0, startTop = 0;
+                let raf = 0;
+                let nextLeft = 0, nextTop = 0;
+
+                function applyPos() {
+                    raf = 0;
+                    el.dataset.x = String(nextLeft);
+                    el.dataset.y = String(nextTop);
+                    applyStoredPosition();
+                }
+
+                function onMove(e) {
+                    if (!dragging) return;
+
+                    const dx = e.clientX - startX;
+                    const dy = e.clientY - startY;
+
+                    nextLeft = startLeft + dx;
+                    nextTop = startTop + dy;
+
+                    if (!raf) raf = requestAnimationFrame(applyPos);
+                    e.preventDefault();
+                }
+
+                function onUp(e) {
+                    if (!dragging) return;
+                    dragging = false;
+
+                    window.removeEventListener('pointermove', onMove, true);
+                    window.removeEventListener('pointerup', onUp, true);
+
+                    try { el.releasePointerCapture(e.pointerId); } catch {}
+
+                    if (raf) {
+                        cancelAnimationFrame(raf);
+                        raf = 0;
+                    }
+
+                    el.dataset.x = String(nextLeft);
+                    el.dataset.y = String(nextTop);
+                    applyStoredPosition();
+
+                    e.preventDefault();
+                }
+
+                handle.addEventListener('pointerdown', (e) => {
+                    if (e.button !== 0) return;
+
+                    dragging = true;
+                    bringToFront(el);
+
+                    startLeft = parseFloat(el.dataset.x || el.offsetLeft || 0);
+                    startTop  = parseFloat(el.dataset.y || el.offsetTop || 0);
+
+                    startX = e.clientX;
+                    startY = e.clientY;
+
+                    nextLeft = startLeft;
+                    nextTop = startTop;
+
+                    try { el.setPointerCapture(e.pointerId); } catch {}
+
+                    window.addEventListener('pointermove', onMove, true);
+                    window.addEventListener('pointerup', onUp, true);
+
+                    e.preventDefault();
+                    e.stopPropagation();
+                });
+
+                el.addEventListener('mousedown', () => bringToFront(el), {passive: true});
+
+                // IMPORTANT:
+                // If NiceGUI rewrites the style attribute, restore the stored x/y immediately.
+                const styleObserver = new MutationObserver(() => {
+                    if (!dragging) applyStoredPosition();
+                });
+                styleObserver.observe(el, {
+                    attributes: true,
+                    attributeFilter: ['style']
+                });
+                el._pyfcsStyleObserver = styleObserver;
+
+                // Initial position application
+                applyStoredPosition();
             }
 
-            function onMove(e) {
-                if (!dragging) return;
+            window.restoreFloatingPosition = function(elId) {
+                const el = document.getElementById(elId);
+                if (!el) return;
 
-                const dx = e.clientX - startX;
-                const dy = e.clientY - startY;
+                const x = parseFloat(el.dataset.x || '0');
+                const y = parseFloat(el.dataset.y || '0');
 
-                nextLeft = startLeft + dx;
-                nextTop  = startTop  + dy;
-
-                if (!raf) raf = requestAnimationFrame(applyPos);
-                e.preventDefault();
-            }
-
-            function onUp(e) {
-                if (!dragging) return;
-                dragging = false;
-
-                window.removeEventListener('pointermove', onMove, true);
-                window.removeEventListener('pointerup', onUp, true);
-
-                try { el.releasePointerCapture(e.pointerId); } catch {}
-                e.preventDefault();
-            }
-
-            handle.addEventListener('pointerdown', (e) => {
-                // Only left mouse button and only from the handle
-                if (e.button !== 0) return;
-
-                dragging = true;
-                bringToFront(el);
-
-                // offsetLeft/Top avoids weird jumps from bounding rect/scroll
-                startLeft = el.offsetLeft;
-                startTop  = el.offsetTop;
-
-                startX = e.clientX;
-                startY = e.clientY;
-
-                // Capture pointer to keep dragging even if leaving handle area
-                try { el.setPointerCapture(e.pointerId); } catch {}
-
-                // Listen globally for smoother behavior
-                window.addEventListener('pointermove', onMove, true);
-                window.addEventListener('pointerup', onUp, true);
-
-                e.preventDefault();
-                e.stopPropagation();
-            });
-
-            // Clicking the window brings it to front (without moving it)
-            el.addEventListener('mousedown', () => bringToFront(el), {passive: true});
-            }
-            </script>
+                el.style.left = x + 'px';
+                el.style.top = y + 'px';
+                el.style.transform = 'none';
+            };
+        </script>
         ''')
 
         # JavaScript: register a pixel picker on an <img> element and emit a "pick" event to backend
@@ -1738,65 +1800,50 @@ class PyFCSWebApp:
         finally:
             self.hide_loading()
 
+
+
     def create_floating_window(self, filename: str, display_name: str | None = None):
         """
         Create a web "floating window" for an image.
-
-        The floating window is implemented as a NiceGUI card that is:
-        - Draggable (via the JS makeDraggable helper)
-        - Resizable (CSS resize: both)
-        - Self-contained (stores references to its UI widgets in self.image_windows)
-
-        The window also prepares per-image caches that are used by mapping/legend features.
-
-        Parameters
-        ----------
-        filename : str
-            Path to the image file on the server.
-        display_name : str | None
-            Optional window title. If None, the basename of `filename` is used.
         """
-        # Main registry: window_id -> metadata + widget references
         if not hasattr(self, "image_windows"):
             self.image_windows = {}
 
-        # --- Ensure caches exist (so we can remove entries on close) ---
         if not hasattr(self, "label_map_cache"):
-            self.label_map_cache = {}          # e.g. (window_id, max_side) -> label_map
+            self.label_map_cache = {}
         if not hasattr(self, "mapping_all_cache"):
-            self.mapping_all_cache = {}        # e.g. (window_id, scheme, max_side) -> data_url
+            self.mapping_all_cache = {}
         if not hasattr(self, "proto_map_cache"):
-            self.proto_map_cache = {}          # e.g. (window_id, chosen, max_side, scheme) -> (data_url, info_text)
+            self.proto_map_cache = {}
         if not hasattr(self, "proto_membership_cache"):
-            self.proto_membership_cache = {}   # e.g. (window_id, chosen, max_side) -> gray_uint8
+            self.proto_membership_cache = {}
         if not hasattr(self, "scheme_cache"):
-            self.scheme_cache = {}             # window_id -> 'centroid' | 'hsv'
+            self.scheme_cache = {}
+        if not hasattr(self, "cm_cache"):
+            self.cm_cache = {}
+        if not hasattr(self, "best_idx_cache"):
+            self.best_idx_cache = {}
 
-        # Unique window id
         window_id = f"img_{len(self.image_windows) + 1}"
-
-        # Window title shown in the title bar
         title = display_name or os.path.basename(filename)
 
-        # Per-window state: whether to show original vs mapped image
         if not hasattr(self, "ORIGINAL_IMG"):
             self.ORIGINAL_IMG = {}
         self.ORIGINAL_IMG.setdefault(window_id, True)
 
-        # Per-window state: whether membership overlays are enabled (only if a color space is loaded)
         if hasattr(self, "MEMBERDEGREE_IMG"):
             self.MEMBERDEGREE_IMG.setdefault(window_id, bool(self.COLOR_SPACE))
 
-        # Initial cascade position so multiple windows do not overlap perfectly
         x0 = 20 + 30 * (len(self.image_windows) % 6)
         y0 = 20 + 30 * (len(self.image_windows) % 6)
 
-        # IMPORTANT: create the registry entry BEFORE creating widgets that reference it
+        preview_source = self._make_preview_data_url_from_path(filename, max_side=self.PREVIEW_MAX_SIDE)
+
         self.image_windows[window_id] = {
             "path": filename,
             "title": title,
-            "original_source": filename,
-            "current_source": filename,
+            "original_source": preview_source,
+            "current_source": preview_source,
             "card": None,
             "img": None,
             "img_container": None,
@@ -1806,69 +1853,187 @@ class PyFCSWebApp:
             "legend_info": None,
             "alt_colors_btn": None,
             "legend_visible": False,
-            "width": 320,
-            "height": 320,
+
+            # CHANGED: persist floating position
+            "x": x0,
+            "y": y0,
+
+            # preview cache placeholders
+            "preview_cache_ready": False,
+            "preview_np": None,
+            "preview_hash": None,
+            "lab_q": None,
+            "lab_int": None,
+            "uniq": None,
+            "inv": None,
+            "preview_h": None,
+            "preview_w": None,
         }
 
-        # Render the floating card inside the image workspace container
+        # This avoids repeated resize/RGB->LAB/unique work later.
+        self._prepare_window_preview_cache(window_id)
+
         with self.image_workspace:
-            card = ui.card().classes('w-[320px] max-w-[700px] max-h-[700px]').props(f'id={window_id}').style(
-                # Absolute positioning + resizable card
-                f'position:absolute; left:{x0}px; top:{y0}px; z-index:2000; resize: both; overflow: auto;'
+            card = ui.card() \
+            .classes('max-w-[700px] max-h-[700px] flex flex-col') \
+            .props(f'id={window_id}') \
+            .style(
+                f'position:absolute; left:{x0}px; top:{y0}px; z-index:2000; '
+                'width:320px; height:320px; resize:both; overflow:hidden; '
                 'min-width:220px; min-height:220px;'
-            )
+            ) \
+            .on('window_moved', lambda e, wid=window_id: self._on_window_moved(wid, e))
             self.image_windows[window_id]["card"] = card
 
             with card:
-                # Title bar (acts as drag handle)
                 handle_id = f'{window_id}_handle'
-                with ui.row().classes('w-full items-center justify-between q-pa-sm bg-gray-200'):
+                with ui.row().classes('w-full items-center justify-between q-pa-sm bg-gray-200 shrink-0'):
                     ui.label(title).classes('text-sm font-bold select-none').props(f'id={handle_id}')
 
-                    # Window controls: menu + close button
                     with ui.row().classes('gap-1'):
                         with ui.menu() as m:
                             ui.menu_item('Original Image', on_click=lambda wid=window_id: self.show_original_image(wid))
                             ui.menu_item('Color Mapping', on_click=lambda wid=window_id: self.color_mapping(wid))
                             ui.menu_item('Color Mapping All', on_click=lambda wid=window_id: self.color_mapping_all(wid))
-                            # No "Toggle Legend" entry (as requested)
 
                         ui.button(icon='more_vert', on_click=m.open).props('flat dense')
                         ui.button(icon='close', on_click=lambda wid=window_id: self.close_image_window(wid)).props('flat dense')
 
-                # Image widget (grows with the resized card)
-                img = ui.image(filename).classes('w-full h-auto object-contain bg-white q-ma-sm')
-                self.image_windows[window_id]["img"] = img
+                with ui.element('div').classes('w-full flex-1 min-h-0 overflow-hidden bg-white q-ma-sm') as img_container:
+                    img = ui.image(preview_source).classes('w-full h-full object-contain')
+                    self.image_windows[window_id]["img"] = img
+                    self.image_windows[window_id]["img_container"] = img_container
 
-                # Legend container (hidden by default)
                 legend_box = ui.card().classes('w-full q-ma-sm q-pa-sm shrink-0').style('display:none;')
                 with legend_box:
                     legend_title = ui.label('Legend').classes('font-bold text-sm')
                     legend_scroll = ui.scroll_area().classes('w-full h-[110px] q-pa-xs')
                     legend_info = ui.label('').classes('text-xs text-gray-600')
 
-                    # Alternate color scheme button (centroid/hsv, etc.)
                     alt_btn = ui.button(
                         'Alt. Colors',
                         on_click=lambda wid=window_id: self.toggle_color_scheme(wid),
                     ).props('dense')
 
-                # Store legend widget references
                 self.image_windows[window_id]["legend_box"] = legend_box
                 self.image_windows[window_id]["legend_title"] = legend_title
                 self.image_windows[window_id]["legend_scroll"] = legend_scroll
                 self.image_windows[window_id]["legend_info"] = legend_info
                 self.image_windows[window_id]["alt_colors_btn"] = alt_btn
 
-        # Enable drag behavior once the DOM is ready
-        ui.timer(
-            0.05,
-            lambda wid=window_id: (
-                ui.run_javascript(f"makeDraggable('{wid}', '{wid}_handle');"),
-                self._install_resize_observer(wid),
-            ),
-            once=True,
-        )
+        ui.run_javascript(f"""
+            setTimeout(() => {{
+                const el = document.getElementById("{window_id}");
+                const handle = document.getElementById("{window_id}_handle");
+                if (!el || !handle) return;
+
+                makeDraggable("{window_id}", "{window_id}_handle");
+
+                const savePos = () => {{
+                    el.dataset.currentLeft = String(parseFloat(el.style.left || '0'));
+                    el.dataset.currentTop = String(parseFloat(el.style.top || '0'));
+                }};
+
+                if (!el._pyfcsPosObserverInstalled) {{
+                    el._pyfcsPosObserverInstalled = true;
+                    savePos();
+
+                    const observer = new MutationObserver(savePos);
+                    observer.observe(el, {{
+                        attributes: true,
+                        attributeFilter: ['style']
+                    }});
+
+                    el._pyfcsPosObserver = observer;
+                }}
+            }}, 50);
+        """)
+
+
+
+    def _remember_window_position(self, window_id: str):
+        """
+        Read the current DOM position of the floating image window and store it in Python.
+        """
+        ui.run_javascript(f"""
+            (() => {{
+                const el = document.getElementById("{window_id}");
+                if (!el) return;
+
+                const x = parseFloat(el.style.left || '0');
+                const y = parseFloat(el.style.top || '0');
+
+                window.pyfcsWindowPos = window.pyfcsWindowPos || {{}};
+                window.pyfcsWindowPos["{window_id}"] = {{ x, y }};
+            }})()
+        """)
+
+
+    def _install_position_observer(self, window_id: str):
+        """
+        Track window position directly on DOM dataset so it can be restored later.
+        """
+        ui.run_javascript(f"""
+            (() => {{
+                const el = document.getElementById("{window_id}");
+                if (!el) return;
+
+                if (el._pyfcsPosObserverInstalled) return;
+                el._pyfcsPosObserverInstalled = true;
+
+                const savePos = () => {{
+                    el.dataset.currentLeft = String(parseFloat(el.style.left || '0'));
+                    el.dataset.currentTop = String(parseFloat(el.style.top || '0'));
+                }};
+
+                savePos();
+
+                const observer = new MutationObserver(savePos);
+                observer.observe(el, {{
+                    attributes: true,
+                    attributeFilter: ['style']
+                }});
+
+                el._pyfcsPosObserver = observer;
+            }})();
+        """)
+
+
+    def _restore_window_position(self, window_id: str):
+        """
+        Restore floating position from Python state.
+        """
+        win = self.image_windows.get(window_id)
+        if not win:
+            return
+
+        left = int(win.get("x", 20))
+        top = int(win.get("y", 20))
+
+        ui.run_javascript(f"""
+            (() => {{
+                const el = document.getElementById("{window_id}");
+                if (!el) return;
+                el.style.left = "{left}px";
+                el.style.top = "{top}px";
+                el.dataset.currentLeft = "{left}";
+                el.dataset.currentTop = "{top}";
+            }})()
+        """)
+
+
+    def _sync_window_position_from_browser(self, window_id: str):
+        """
+        Pull the latest browser-stored position into Python state.
+        """
+        ui.run_javascript(f"""
+            (() => {{
+                const pos = window.pyfcsWindowPos && window.pyfcsWindowPos["{window_id}"];
+                if (!pos) return;
+                window.__pyfcs_last_pos = pos;
+            }})()
+        """)
+
 
     def toggle_legend(self, window_id: str):
         """
@@ -1893,115 +2058,125 @@ class PyFCSWebApp:
     def close_image_window(self, window_id: str):
         """
         Close an image floating window and purge all related cached data.
-
-        This method:
-        - Removes the card from the DOM
-        - Deletes any cache entries tied to the window_id
-        - Removes per-window state flags (scheme_cache, ORIGINAL_IMG, MEMBERDEGREE_IMG)
-        - Finally deletes the entry from self.image_windows
         """
         win = getattr(self, "image_windows", {}).get(window_id)
         if not win:
             return
 
-        # Remove window card from the page
-        if win.get("card") is not None:
-            win["card"].delete()
+        # 1) Clean JS observers first, while the DOM node still exists
+        ui.run_javascript(f"""
+            (() => {{
+                const el = document.getElementById("{window_id}");
+                if (!el) return;
 
-        # --- Clear caches related to this image window ---
+                if (el._pyfcsPosObserver) {{
+                    el._pyfcsPosObserver.disconnect();
+                    el._pyfcsPosObserver = null;
+                }}
+                el._pyfcsPosObserverInstalled = false;
+            }})();
+        """)
+
+        # 2) Clean legend-follow hooks before deleting any element
+        self._uninstall_legend_follow_behavior(window_id)
+
+        # 3) Delete separate legend window first
+        if hasattr(self, "legend_windows") and window_id in self.legend_windows:
+            lw = self.legend_windows.pop(window_id)
+            if lw:
+                lw.delete()
+
+        # 4) Clear caches
         for k in list(getattr(self, "label_map_cache", {}).keys()):
-            if k[0] == window_id:
+            if isinstance(k, tuple) and len(k) > 0 and k[0] == window_id:
                 del self.label_map_cache[k]
 
         for k in list(getattr(self, "mapping_all_cache", {}).keys()):
-            if k[0] == window_id:
+            if isinstance(k, tuple) and len(k) > 0 and k[0] == window_id:
                 del self.mapping_all_cache[k]
 
         for k in list(getattr(self, "proto_map_cache", {}).keys()):
-            if k[0] == window_id:
+            if isinstance(k, tuple) and len(k) > 0 and k[0] == window_id:
                 del self.proto_map_cache[k]
 
         for k in list(getattr(self, "proto_membership_cache", {}).keys()):
-            if k[0] == window_id:
+            if isinstance(k, tuple) and len(k) > 0 and k[0] == window_id:
                 del self.proto_membership_cache[k]
 
-        # Remove per-window scheme state
+        if hasattr(self, "cm_cache") and window_id in self.cm_cache:
+            del self.cm_cache[window_id]
+
         if hasattr(self, "scheme_cache") and window_id in self.scheme_cache:
             del self.scheme_cache[window_id]
 
-        # Remove per-window flags
         if hasattr(self, "ORIGINAL_IMG") and window_id in self.ORIGINAL_IMG:
             del self.ORIGINAL_IMG[window_id]
 
         if hasattr(self, "MEMBERDEGREE_IMG") and window_id in self.MEMBERDEGREE_IMG:
             del self.MEMBERDEGREE_IMG[window_id]
 
-        # Remove from registry
+        # 5) Delete the image card LAST
+        if win.get("card") is not None:
+            win["card"].delete()
+
+        # 6) Remove registry entry at the very end
         del self.image_windows[window_id]
 
 
-    def _install_resize_observer(self, window_id: str):
-        ui.run_javascript(f"""
-            (() => {{
-                const el = document.getElementById("{window_id}");
-                if (!el) return;
+    def _make_preview_data_url_from_path(self, path: str, max_side: int) -> str:
+        """
+        Build a display preview (PNG data URL) from an image file.
 
-                if (el._pyfcsResizeObserverInstalled) return;
-                el._pyfcsResizeObserverInstalled = true;
+        IMPORTANT:
+        - This preview is used as the "original image" shown in the floating window.
+        - We intentionally display a reduced version so that:
+            * Original Image
+            * Color Mapping
+            * Color Mapping All
+        all share the same base dimensions and do not visually reflow the window.
+        """
+        img = Image.open(path).convert('RGB')
 
-                const observer = new ResizeObserver(entries => {{
-                    const r = entries[0].contentRect;
-                    window.pyfcsWindowSizes = window.pyfcsWindowSizes || {{}};
-                    window.pyfcsWindowSizes["{window_id}"] = {{
-                        width: Math.round(r.width),
-                        height: Math.round(r.height),
-                    }};
-                }});
+        w, h = img.size
+        if max(w, h) > max_side:
+            scale = max_side / float(max(w, h))
+            img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
 
-                observer.observe(el);
-            }})();
-        """)
+        return self._np_to_data_url(np.array(img, dtype=np.uint8))
+    
 
-    async def _remember_window_size(self, window_id: str):
-        size = await ui.run_javascript(f"""
-            (() => {{
-                const el = document.getElementById("{window_id}");
-                if (!el) return null;
+    def _on_window_moved(self, window_id: str, e):
+        """
+        Persist the dragged floating window position in Python state and server-side style.
+        """
+        try:
+            args = e.args or {}
+            left = int(round(float(args.get('left', 0))))
+            top = int(round(float(args.get('top', 0))))
 
-                const stored = window.pyfcsWindowSizes && window.pyfcsWindowSizes["{window_id}"];
-                if (stored) return stored;
+            win = self.image_windows.get(window_id)
+            if not win:
+                return
 
-                const r = el.getBoundingClientRect();
-                return {{ width: Math.round(r.width), height: Math.round(r.height) }};
-            }})()
-        """)
+            win["x"] = left
+            win["y"] = top
 
-        if size:
-            self.image_windows[window_id]["width"] = int(size["width"])
-            self.image_windows[window_id]["height"] = int(size["height"])
+            # IMPORTANT:
+            # Update the NiceGUI element style so future UI refreshes keep the new position
+            card = win.get("card")
+            if card is not None:
+                card.style(
+                    f'position:absolute; left:{left}px; top:{top}px; z-index:2000; '
+                    'width:320px; height:320px; resize:both; overflow:hidden; '
+                    'min-width:220px; min-height:220px;'
+                )
 
-    async def _apply_window_size(self, window_id: str):
-        win = self.image_windows.get(window_id)
-        if not win:
-            return
+            # If legend exists, keep it attached after persisting the new position
+            if hasattr(self, "legend_windows") and window_id in self.legend_windows:
+                self._move_legend_next_to_image(window_id)
 
-        w = int(win.get("width", 320))
-        h = int(win.get("height", 320))
-
-        await ui.run_javascript(f"""
-            (() => {{
-                const el = document.getElementById("{window_id}");
-                if (!el) return;
-                el.style.width = "{w}px";
-                el.style.height = "{h}px";
-            }})()
-        """)
-
-    async def _preserve_window_size(self, window_id: str):
-        await self._remember_window_size(window_id)
-        await self._apply_window_size(window_id)
-
-
+        except Exception as ex:
+            self.custom_warning("Move Error", str(ex))
 
 
 
@@ -2023,6 +2198,36 @@ class PyFCSWebApp:
     # The web version heavily uses caching because recomputing fuzzy memberships
     # per pixel is expensive. For repeated actions, cached results are reused.
     # -------------------------------------------------------------------------
+    async def show_original_image(self, window_id: str):
+        """
+        Restore and display the original preview image in the floating window.
+        """
+        try:
+            win = self.image_windows[window_id]
+            win["img"].set_source(win["original_source"])
+            win["current_source"] = win["original_source"]
+
+            if "legend_box" in win:
+                win["legend_box"].style('display:none;')
+
+            win["legend_visible"] = False
+            self.ORIGINAL_IMG[window_id] = False
+            self._restore_window_position(window_id)
+            ui.notify('Original image restored')
+
+            # CHANGED:
+            # Remove follow hooks before deleting the separate legend window.
+            self._uninstall_legend_follow_behavior(window_id)
+
+            if hasattr(self, "legend_windows") and window_id in self.legend_windows:
+                lw = self.legend_windows.pop(window_id)
+                if lw:
+                    lw.delete()
+
+        except Exception as e:
+            self.custom_warning("Display Error", str(e))
+
+
     def color_mapping(self, window_id: str):
         """
         Apply a **single-prototype** membership visualization on the selected image window.
@@ -2070,10 +2275,8 @@ class PyFCSWebApp:
                 d.close()
                 self.show_loading("Color Mapping...")
 
-                await self._remember_window_size(window_id)
-
                 try:
-                    max_side = 400
+                    max_side = self.PREVIEW_MAX_SIDE
 
                     # 1) Load a reduced working image (HxWx3 uint8)
                     img_np = self._get_work_image_np(window_id, max_side=max_side)
@@ -2091,9 +2294,7 @@ class PyFCSWebApp:
                         win = self.image_windows[window_id]
                         win["img"].set_source(data_url)
                         win["current_source"] = data_url
-
-                        await asyncio.sleep(0)
-                        await self._apply_window_size(window_id)
+                        self._restore_window_position(window_id)
 
                         self._render_legend(
                             window_id,
@@ -2148,10 +2349,6 @@ class PyFCSWebApp:
                     if hasattr(self, "MEMBERDEGREE"):
                         self.MEMBERDEGREE[window_id] = False
 
-                    # Optionally auto-show the legend panel
-                    if not self.image_windows[window_id].get("legend_visible", False):
-                        self.toggle_legend(window_id)
-
                 except Exception as e:
                     self.custom_warning("Processing Error", str(e))
                 finally:
@@ -2160,8 +2357,9 @@ class PyFCSWebApp:
             with ui.row().classes('justify-end gap-2'):
                 ui.button('Cancel', on_click=d.close).props('flat')
                 ui.button('Apply', icon='palette', on_click=_apply)
-
         d.open()
+
+
 
     def _np_to_data_url(self, arr_uint8: np.ndarray) -> str:
         """
@@ -2247,182 +2445,127 @@ class PyFCSWebApp:
 
         return out
 
+
     def _compute_label_map(self, img_uint8: np.ndarray, progress_callback=None) -> np.ndarray:
         """
-        Compute the best fuzzy label for each pixel in an image.
+        Compute the best prototype index for each pixel in an image.
 
-        Steps:
-        - Convert RGB uint8 -> LAB (skimage)
-        - Quantize LAB values to 0.01 precision (round(..., 2))
-        - For each pixel:
-            * compute membership dict = fuzzy_color_space.calculate_membership(lab_color)
-            * choose the label with maximum membership
-        - Returns a (H, W) array of Python objects (strings or None)
-
-        Performance notes:
-        - A membership_cache dict is used to avoid recalculating memberships for
-          repeated LAB values (very common after quantization).
-        - progress_callback(processed, total) can be provided to update UI progress.
-
-        Parameters
-        ----------
-        img_uint8 : np.ndarray
-            Image as HxWx3 uint8.
-        progress_callback : callable | None
-            Function called with (processed, total) occasionally.
+        OPTIMIZATION:
+        - Convert RGB -> LAB
+        - Quantize LAB using self.LAB_QUANT_STEP
+        - Find unique quantized LAB values
+        - Compute best prototype index only once per unique color
+        - Rebuild the full index map through inverse indices
 
         Returns
         -------
         np.ndarray
-            Object array (H, W) with the best label (string) or None.
+            int32 array (H, W), values:
+            - 0..N-1 = prototype index
+            - -1     = no prototype found
         """
-        # Ensure internal precomputations are ready (safe to call repeatedly)
         self.fuzzy_color_space.precompute_pack()
 
-        # Convert RGB -> LAB
         img01 = img_uint8.astype(np.float32) / 255.0
         lab_img = skcolor.rgb2lab(img01)
-
-        # Quantize LAB to reduce unique values and speed up caching
-        lab_q = np.round(lab_img, 2)
+        lab_q = self._quantize_lab(lab_img)
 
         h, w = lab_q.shape[:2]
-        total = h * w
-        label_map = np.empty((h, w), dtype=object)
+        step = float(getattr(self, 'LAB_QUANT_STEP', 0.05))
+        lab_int = np.round(lab_q.reshape(-1, 3) / step).astype(np.int32)
 
-        # Cache: quantized LAB key -> best label
-        membership_cache = {}
-        processed = 0
+        uniq, inv = np.unique(lab_int, axis=0, return_inverse=True)
+        best_for_uniq = self._best_idx_for_unique_lab(uniq, progress_callback)
 
-        for y in range(h):
-            for x in range(w):
-                lab_color = lab_q[y, x]
-
-                # Integer key to reduce float hashing issues
-                key = (int(lab_color[0] * 100), int(lab_color[1] * 100), int(lab_color[2] * 100))
-
-                best_label = membership_cache.get(key)
-                if best_label is None:
-                    m = self.fuzzy_color_space.calculate_membership(lab_color)
-                    best_label = max(m, key=m.get) if m else None
-                    membership_cache[key] = best_label
-
-                label_map[y, x] = best_label
-                processed += 1
-
-                # Update progress periodically
-                if progress_callback and (processed % 5000 == 0 or processed == total):
-                    progress_callback(processed, total)
-
+        label_map = best_for_uniq[inv].reshape(h, w).astype(np.int32)
         return label_map
 
-    async def show_original_image(self, window_id: str):
-        """
-        Restore and display the original image in the floating window.
-
-        This:
-        - Sets the image source back to win["original_source"]
-        - Hides the legend panel
-        - Updates ORIGINAL_IMG state flag
-        """
-        try:
-            await self._remember_window_size(window_id)
-
-            win = self.image_windows[window_id]
-            win["img"].set_source(win["original_source"])
-            win["current_source"] = win["original_source"]
-
-            if "legend_box" in win:
-                win["legend_box"].style('display:none;')
-
-            await asyncio.sleep(0)
-            await self._apply_window_size(window_id)
-
-            self.ORIGINAL_IMG[window_id] = False
-            ui.notify('Original image restored')
-
-        except Exception as e:
-            self.custom_warning("Display Error", str(e))
 
     def color_mapping_all(self, window_id: str):
         """
-        Apply **full image** color mapping: each pixel is assigned the best fuzzy label,
-        and then recolored using a chosen color scheme.
+        Apply **full image** color mapping using fast prototype-index mapping.
 
-        Requirements:
-        - A color space must be loaded.
+        OPTIMIZATIONS APPLIED:
+        1) Reuse label_map when only palette changes
+        2) Cache by actual preview image content
+        3) Avoid repeated RGB->LAB conversion by using precomputed preview cache
+        4) Reuse unique quantized LAB colors + inverse mapping
+        5) Global cache for best_prototype_index_from_lab
+        6) More aggressive LAB quantization for web preview
 
-        Workflow:
-        - Load a reduced working image (max_side=400).
-        - Compute (or reuse) the label_map for this image window:
-            label_map[y,x] = best label (string) or None
-        - Convert label_map -> RGB output using a color scheme:
-            * 'centroid': use each label centroid color
-            * 'hsv'     : use an HSV colormap for distinct label colors
-        - Render output as a PNG data URL and update the window image.
-        - Render/update the legend.
-
-        UI threading:
-        - Uses `context.client` and wraps UI updates with `with client:` because
-          heavy computations are done in a background task.
+        IMPORTANT:
+        The display always uses the reduced-size preview, so the visual size remains
+        stable when switching between Original / Color Mapping / Color Mapping All.
         """
         if not getattr(self, 'COLOR_SPACE', False):
             self.custom_warning("No Color Space", "Load a color space first (.cns or .fcs).")
             return
 
-        client = context.client  # UI context for the current user session
+        client = context.client
 
         async def _run():
-            # UI calls must be executed within the client context
             with client:
                 self.show_loading("Color Mapping All...")
 
             try:
-                # Reduced image for faster preview mapping
-                img_np = self._get_work_image_np(window_id, max_side=400)
+                self.fuzzy_color_space.precompute_pack()
 
-                # Progress callback updates the loading bar
+                # CHANGED:
+                # Ensure preview preprocessing is ready only once.
+                self._prepare_window_preview_cache(window_id)
+                win = self.image_windows[window_id]
+
+                preview_hash = win["preview_hash"]
+                proto_sig = self._prototype_signature()
+
+                # CHANGED:
+                # Cache by actual preview content + prototypes, not just by window_id.
+                cache_key = (preview_hash, proto_sig)
+
+                if not hasattr(self, "cm_cache"):
+                    self.cm_cache = {}
+                if window_id not in self.cm_cache:
+                    self.cm_cache[window_id] = {}
+
                 def progress(cur, total):
                     with client:
                         self.set_loading_progress(cur / total)
 
-                # Compute label map only once per window (cached)
-                if window_id not in self.label_map_cache:
-                    label_map = await asyncio.to_thread(self._compute_label_map, img_np, progress)
-                    self.label_map_cache[window_id] = label_map
+                # CHANGED:
+                # Reuse precomputed uniq/inv instead of recomputing RGB->LAB and np.unique every time.
+                if cache_key not in self.cm_cache[window_id]:
+                    uniq = win["uniq"]
+                    inv = win["inv"]
+                    h = win["preview_h"]
+                    w = win["preview_w"]
+
+                    best_for_uniq = await asyncio.to_thread(self._best_idx_for_unique_lab, uniq, progress)
+                    label_map = best_for_uniq[inv].reshape(h, w).astype(np.int32)
+
+                    self.cm_cache[window_id][cache_key] = {
+                        "label_map": label_map,
+                        "preview_hash": preview_hash,
+                        "proto_sig": proto_sig,
+                    }
                 else:
-                    label_map = self.label_map_cache[window_id]
+                    label_map = self.cm_cache[window_id][cache_key]["label_map"]
 
-                # Choose recoloring scheme for labels
+                # CHANGED:
+                # Recolor instantly from cached label_map when only palette changes.
                 scheme = self.scheme_cache.get(window_id, 'centroid')
-                colors = self._label_colors_centroid() if scheme == 'centroid' else self._label_colors_hsv()
+                palette = self._palette_centroid_uint8() if scheme == 'centroid' else self._palette_hsv_uint8()
 
-                # Build recolored output image
-                h, w = label_map.shape
-                out = np.zeros((h, w, 3), dtype=np.uint8)
+                out = self._render_recolored_from_index_map(label_map, palette)
 
-                for label, rgb in colors.items():
-                    out[label_map == label] = rgb
-
-                # Pixels with no label -> black
-                out[label_map == None] = np.array([0, 0, 0], dtype=np.uint8)
-
-                # Store and display
                 self.modified_image[window_id] = out
                 data_url = self._np_to_data_url(out)
-
-                await self._remember_window_size(window_id)
 
                 with client:
                     win = self.image_windows[window_id]
                     win["img"].set_source(data_url)
                     win["current_source"] = data_url
                     self._render_legend(window_id)
-                    ui.notify('Color mapping applied (preview)')
-                
-                await asyncio.sleep(0)
-                with client:
-                    await self._apply_window_size(window_id)
+                    self._restore_window_position(window_id)
                     ui.notify('Color mapping applied (preview)')
 
             except Exception as e:
@@ -2433,10 +2576,11 @@ class PyFCSWebApp:
                 with client:
                     self.hide_loading()
 
-        # Run asynchronously so the UI remains responsive
         asyncio.create_task(_run())
 
-    def _get_work_image_np(self, window_id: str, max_side: int = 400) -> np.ndarray:
+        
+
+    def _get_work_image_np(self, window_id: str, max_side: int) -> np.ndarray:
         """
         Load the image window file into a resized numpy array (uint8 RGB).
 
@@ -2465,84 +2609,67 @@ class PyFCSWebApp:
 
         return np.array(img, dtype=np.uint8)
 
-    def _render_legend(self, window_id: str, only_labels=None, info: str | None = None, mode: str = 'all'):
+
+    def _render_legend(self, window_id: str, only_labels=None, info=None, mode='all'):
         """
-        Render/update the legend panel for an image window.
-
-        The legend displays:
-        - A swatch per label (from the current color scheme)
-        - The label name
-        - Optional info text (e.g., selected prototype stats)
-
-        Parameters
-        ----------
-        window_id : str
-            Target image window.
-        only_labels : list[str] | None
-            If provided, render only these labels. Otherwise render all labels.
-        info : str | None
-            Optional text shown under the legend list.
-        mode : str
-            'all'    -> show Alt. Colors button
-            'single' -> hide Alt. Colors button (used in single-prototype mode)
+        Render legend in a separate floating window.
         """
-        win = self.image_windows[window_id]
 
-        legend_box = win.get("legend_box")
-        legend_scroll = win.get("legend_scroll")
-        legend_info = win.get("legend_info")
-        alt_btn = win.get("alt_colors_btn")
-
-        if legend_box is None or legend_scroll is None or legend_info is None:
-            return
-
-        # Always show legend when rendering it
-        legend_box.style('display:block;')
-
-        # Show/hide Alt. Colors depending on mode
-        if alt_btn is not None:
-            alt_btn.set_visibility(mode == 'all')
-
-        # Determine current scheme and build label->RGB mapping
         scheme = self.scheme_cache.get(window_id, 'centroid')
         colors = self._label_colors_centroid() if scheme == 'centroid' else self._label_colors_hsv()
 
-        # Decide which labels to show
-        labels = only_labels if only_labels is not None else list(getattr(self, 'color_matrix', []) or [])
+        labels = only_labels if only_labels is not None else [p.label for p in self.prototypes]
 
-        # Build legend entries
-        legend_scroll.clear()
-        with legend_scroll:
-            for lab in labels:
-                rgb = colors.get(lab, np.array([0, 0, 0], dtype=np.uint8))
-                hexcol = f'#{int(rgb[0]):02x}{int(rgb[1]):02x}{int(rgb[2]):02x}'
-                with ui.row().classes('items-center gap-2'):
-                    ui.html(
-                        f'<div style="width:18px;height:18px;border:1px solid #000;background:{hexcol};border-radius:3px;"></div>',
-                        sanitize=False,
-                    )
-                    ui.label(lab).classes('text-sm')
+        # CHANGED:
+        # Pass mode through so the separate legend window knows whether to show
+        # the Alt. Colors button (only for full Color Mapping All mode).
+        self._show_legend_window(window_id, labels, colors, info, mode=mode)
 
-        # Info text area
-        legend_info.set_text(info or '')
 
     def toggle_color_scheme(self, window_id: str):
         """
         Toggle the recoloring scheme used in Color Mapping All:
-        - 'centroid' (default): uses centroid LAB->RGB per label
-        - 'hsv'              : uses an HSV colormap for distinct label colors
+        - 'centroid' (default)
+        - 'hsv'
 
-        If a label_map is already cached for this window, recoloring is reapplied
-        instantly without recalculating memberships.
+        OPTIMIZATION:
+        If a label_map is already cached, only recolor the image.
+        No membership recomputation is performed.
         """
         current = self.scheme_cache.get(window_id, 'centroid')
         self.scheme_cache[window_id] = 'hsv' if current == 'centroid' else 'centroid'
 
-        # If label map exists, recolor immediately (no recomputation)
-        if window_id in self.label_map_cache:
-            self.color_mapping_all(window_id)
-        else:
+        if not hasattr(self, "cm_cache") or window_id not in self.cm_cache:
             self._render_legend(window_id)
+            return
+
+        win = self.image_windows.get(window_id)
+        if not win or not win.get("preview_cache_ready", False):
+            self._render_legend(window_id)
+            return
+
+        preview_hash = win["preview_hash"]
+        proto_sig = self._prototype_signature()
+        cache_key = (preview_hash, proto_sig)
+
+        if cache_key not in self.cm_cache[window_id]:
+            # No cached label_map yet -> normal path
+            self.color_mapping_all(window_id)
+            return
+
+        label_map = self.cm_cache[window_id][cache_key]["label_map"]
+        scheme = self.scheme_cache.get(window_id, 'centroid')
+        palette = self._palette_centroid_uint8() if scheme == 'centroid' else self._palette_hsv_uint8()
+
+        out = self._render_recolored_from_index_map(label_map, palette)
+        self.modified_image[window_id] = out
+        data_url = self._np_to_data_url(out)
+
+        win["img"].set_source(data_url)
+        win["current_source"] = data_url
+        self._restore_window_position(window_id)
+        self._render_legend(window_id)
+
 
     def _proto_index_by_label(self, label: str) -> int:
         """
@@ -2558,62 +2685,441 @@ class PyFCSWebApp:
                 return i
         raise ValueError(f'Prototype not found: {label}')
 
+
+
     def _membership_map_for_prototype(self, img_np_rgb255: np.ndarray, proto_index: int, progress_cb=None) -> np.ndarray:
         """
         Compute a grayscale membership map (uint8) for ONE prototype over an image.
 
-        Parameters
-        ----------
-        img_np_rgb255 : np.ndarray
-            Input image as HxWx3 uint8 (0..255).
-        proto_index : int
-            Index of the prototype in self.prototypes for which membership is computed.
-        progress_cb : callable | None
-            Optional callback progress_cb(current, total).
+        OPTIMIZATION:
+        - quantize LAB
+        - compute membership once per unique color
+        - reconstruct final image using inverse mapping
+        """
+        img = img_np_rgb255.astype(np.float32) / 255.0
+        lab = skcolor.rgb2lab(img)
+        lab_q = self._quantize_lab(lab)
+
+        h, w, _ = lab_q.shape
+        step = float(getattr(self, 'LAB_QUANT_STEP', 0.05))
+        lab_int = np.round(lab_q.reshape(-1, 3) / step).astype(np.int32)
+
+        uniq, inv = np.unique(lab_int, axis=0, return_inverse=True)
+
+        total_unique = len(uniq)
+        unique_memberships = np.empty(total_unique, dtype=np.float32)
+
+        fcs = self.fuzzy_color_space
+
+        for i, key_int in enumerate(uniq):
+            lab_color = key_int.astype(np.float32) * step
+            unique_memberships[i] = fcs.calculate_membership_for_prototype(
+                np.array([lab_color[0], lab_color[1], lab_color[2]], dtype=float),
+                proto_index
+            )
+
+            if progress_cb and (i % 200 == 0 or i == total_unique - 1):
+                progress_cb(i + 1, total_unique)
+
+        gray = (unique_memberships[inv].reshape(h, w) * 255.0)
+        gray = np.clip(gray, 0, 255).astype(np.uint8)
+        return gray
+
+
+    def _image_hash(self, arr: np.ndarray) -> str:
+        """
+        Stable hash for a preview image numpy array.
+        Used to cache mapping results by actual preview content.
+        """
+        return hashlib.blake2b(arr.tobytes(), digest_size=16).hexdigest()
+
+
+    def _quantize_lab(self, lab_img: np.ndarray) -> np.ndarray:
+        """
+        Quantize LAB values using a configurable step.
+
+        Example:
+        - step=0.05 -> fewer unique colors -> faster mapping
+        """
+        step = float(getattr(self, 'LAB_QUANT_STEP', 0.05))
+        return np.round(lab_img / step) * step
+
+
+    def _prepare_window_preview_cache(self, window_id: str):
+        """
+        Precompute and cache all preview data needed by mapping.
+
+        Cached data:
+        - preview_np        : HxWx3 uint8 reduced image
+        - preview_hash      : stable content hash
+        - lab_q             : quantized LAB image
+        - lab_int           : flattened integer LAB keys
+        - uniq              : unique LAB keys
+        - inv               : inverse mapping to rebuild image-sized results
+        - h, w              : preview height/width
+
+        This avoids repeating:
+        - file load
+        - resize
+        - RGB -> LAB
+        - quantization
+        - np.unique
+        """
+        win = self.image_windows[window_id]
+
+        if win.get("preview_cache_ready", False):
+            return
+
+        preview_np = self._get_work_image_np(window_id, max_side=self.PREVIEW_MAX_SIDE)
+
+        img01 = preview_np.astype(np.float32) / 255.0
+        lab_img = skcolor.rgb2lab(img01)
+        lab_q = self._quantize_lab(lab_img)
+
+        h, w = lab_q.shape[:2]
+
+        # Integer keys derived from quantized LAB.
+        # We divide by quant step so equal quantized colors share identical integer keys.
+        step = float(getattr(self, 'LAB_QUANT_STEP', 0.05))
+        lab_int = np.round(lab_q.reshape(-1, 3) / step).astype(np.int32)
+
+        uniq, inv = np.unique(lab_int, axis=0, return_inverse=True)
+
+        win["preview_np"] = preview_np
+        win["preview_hash"] = self._image_hash(preview_np)
+        win["lab_q"] = lab_q
+        win["lab_int"] = lab_int
+        win["uniq"] = uniq
+        win["inv"] = inv
+        win["preview_h"] = h
+        win["preview_w"] = w
+        win["preview_cache_ready"] = True
+
+
+    def _palette_centroid_uint8(self) -> np.ndarray:
+        """
+        Build a palette array (N,3) uint8 in self.prototypes order using centroid colors.
+        """
+        palette = []
+
+        for p in self.prototypes:
+            label = getattr(p, 'label', None)
+            if label is None or not hasattr(self, 'color_data') or label not in self.color_data:
+                palette.append(np.array([0, 0, 0], dtype=np.uint8))
+                continue
+
+            v = self.color_data[label]
+            lab = v.get('positive_prototype', None)
+            if lab is None:
+                lab = v.get('Color', None)
+
+            if lab is None:
+                palette.append(np.array([0, 0, 0], dtype=np.uint8))
+                continue
+
+            lab = np.array(lab, dtype=float).reshape(1, 1, 3)
+            rgb01 = skcolor.lab2rgb(lab)[0, 0]
+            rgb255 = (np.clip(rgb01, 0, 1) * 255).astype(np.uint8)
+            palette.append(rgb255)
+
+        return np.stack(palette, axis=0).astype(np.uint8)
+
+
+    def _palette_hsv_uint8(self) -> np.ndarray:
+        """
+        Build a palette array (N,3) uint8 in self.prototypes order using HSV colors.
+        """
+        cmap = plt.get_cmap('hsv', len(self.prototypes))
+        palette = []
+
+        for i, p in enumerate(self.prototypes):
+            rgb01 = np.array(cmap(i)[:3], dtype=float)
+            rgb255 = (np.clip(rgb01, 0, 1) * 255).astype(np.uint8)
+
+            if getattr(p, 'label', '').lower() == 'black':
+                rgb255 = np.array([0, 0, 0], dtype=np.uint8)
+
+            palette.append(rgb255)
+
+        return np.stack(palette, axis=0).astype(np.uint8)
+
+
+    def _prototype_signature(self) -> tuple:
+        """
+        Signature of current prototype set / order.
+        Used to invalidate caches safely when prototypes change.
+        """
+        return tuple(getattr(p, 'label', '') for p in self.prototypes)
+
+
+    def _best_idx_for_unique_lab(self, uniq: np.ndarray, progress_callback=None) -> np.ndarray:
+        """
+        Compute best prototype index for each unique quantized LAB key.
+
+        Uses a global cache:
+            (proto_signature, Lq, Aq, Bq) -> best_idx
 
         Returns
         -------
         np.ndarray
-            HxW uint8 array where 0..255 corresponds to membership degree 0..1.
+            int32 array of shape (len(uniq),), values in [-1, N-1]
         """
-        # Convert RGB to LAB
-        img = img_np_rgb255.astype(np.float32) / 255.0
-        lab = skcolor.rgb2lab(img)
+        if not hasattr(self, "best_idx_cache"):
+            self.best_idx_cache = {}
 
-        # Quantize for caching and stability
-        lab_q = np.round(lab, 2)
+        proto_sig = self._prototype_signature()
+        step = float(getattr(self, 'LAB_QUANT_STEP', 0.05))
 
-        h, w, _ = lab_q.shape
-        flat = lab_q.reshape(-1, 3)
+        out = np.empty((uniq.shape[0],), dtype=np.int32)
 
-        total = flat.shape[0]
-        out = np.empty(total, dtype=np.float32)
-
-        # Cache repeated LAB values -> membership (saves time due to quantization)
-        cache = {}
-        fcs = self.fuzzy_color_space  # alias
+        total = int(uniq.shape[0])
 
         for i in range(total):
-            L, A, B = flat[i]
-            key = (float(L), float(A), float(B))
+            key_int = uniq[i]
+            cache_key = (proto_sig, int(key_int[0]), int(key_int[1]), int(key_int[2]))
 
-            val = cache.get(key)
-            if val is None:
-                val = fcs.calculate_membership_for_prototype(
-                    np.array([L, A, B], dtype=float),
-                    proto_index
-                )
-                cache[key] = val
+            best_idx = self.best_idx_cache.get(cache_key)
+            if best_idx is None:
+                lab_color = key_int.astype(np.float32) * step
+                best_idx = int(self.fuzzy_color_space.best_prototype_index_from_lab(
+                    (float(lab_color[0]), float(lab_color[1]), float(lab_color[2]))
+                ))
+                self.best_idx_cache[cache_key] = best_idx
 
-            out[i] = val
+            out[i] = best_idx
 
-            if progress_cb and (i % 5000 == 0 or i == total - 1):
-                progress_cb(i + 1, total)
+            if progress_callback and (i % 200 == 0 or i == total - 1):
+                progress_callback(i + 1, total)
 
-        # Scale membership (0..1) -> grayscale (0..255)
-        gray = (out.reshape(h, w) * 255.0)
-        gray = np.clip(gray, 0, 255).astype(np.uint8)
-        return gray
+        return out
+
+
+    def _render_recolored_from_index_map(self, label_map_idx: np.ndarray, palette_uint8: np.ndarray) -> np.ndarray:
+        """
+        Fast recolor from prototype index map.
+
+        label_map_idx:
+        - int32 array (H,W)
+        - values 0..N-1 or -1 for no match
+
+        palette_uint8:
+        - (N,3) uint8
+        """
+        out = np.zeros((label_map_idx.shape[0], label_map_idx.shape[1], 3), dtype=np.uint8)
+        valid_mask = (label_map_idx >= 0)
+        if np.any(valid_mask):
+            out[valid_mask] = palette_uint8[label_map_idx[valid_mask].astype(np.int32)]
+        return out
+
+
+    def _move_legend_next_to_image(self, window_id: str):
+        """
+        Reposition an existing legend window so it stays attached to the image window.
+        """
+        if not hasattr(self, "legend_windows") or window_id not in self.legend_windows:
+            return
+
+        legend_card = self.legend_windows.get(window_id)
+        if not legend_card:
+            return
+
+        legend_id = f"{window_id}_legend"
+
+        ui.run_javascript(f"""
+            (() => {{
+                const img = document.getElementById("{window_id}");
+                const legend = document.getElementById("{legend_id}");
+                if (!img || !legend) return;
+
+                const imgLeft = parseFloat(img.style.left || '0');
+                const imgTop = parseFloat(img.style.top || '0');
+                const imgWidth = img.offsetWidth || 0;
+
+                legend.style.left = (imgLeft + imgWidth + 10) + 'px';
+                legend.style.top = imgTop + 'px';
+            }})()
+        """)
+
+
+    def _install_legend_follow_behavior(self, window_id: str):
+        """
+        Install a lightweight observer so the legend follows the image window
+        when the image is dragged or resized.
+        """
+        legend_id = f"{window_id}_legend"
+
+        ui.run_javascript(f"""
+            (() => {{
+                const img = document.getElementById("{window_id}");
+                const legend = document.getElementById("{legend_id}");
+                if (!img || !legend) return;
+
+                // Clean old observers if they still exist
+                if (img._pyfcsLegendMutationObserver) {{
+                    img._pyfcsLegendMutationObserver.disconnect();
+                    img._pyfcsLegendMutationObserver = null;
+                }}
+                if (img._pyfcsLegendResizeObserver) {{
+                    img._pyfcsLegendResizeObserver.disconnect();
+                    img._pyfcsLegendResizeObserver = null;
+                }}
+
+                const syncLegend = () => {{
+                    const imgLeft = parseFloat(img.style.left || '0');
+                    const imgTop = parseFloat(img.style.top || '0');
+                    const imgWidth = img.offsetWidth || 0;
+
+                    legend.style.left = (imgLeft + imgWidth + 10) + 'px';
+                    legend.style.top = imgTop + 'px';
+                }};
+
+                syncLegend();
+
+                const observer = new MutationObserver(syncLegend);
+                observer.observe(img, {{
+                    attributes: true,
+                    attributeFilter: ['style', 'class']
+                }});
+
+                const resizeObserver = new ResizeObserver(syncLegend);
+                resizeObserver.observe(img);
+
+                img._pyfcsLegendMutationObserver = observer;
+                img._pyfcsLegendResizeObserver = resizeObserver;
+                img._pyfcsLegendFollowInstalled = true;
+            }})();
+        """)
+
+    def _uninstall_legend_follow_behavior(self, window_id: str):
+        """
+        Remove the JS observers that keep the legend attached to the image window.
+        This must be called before deleting/recreating the legend window.
+        """
+        ui.run_javascript(f"""
+            (() => {{
+                const img = document.getElementById("{window_id}");
+                if (!img) return;
+
+                if (img._pyfcsLegendMutationObserver) {{
+                    img._pyfcsLegendMutationObserver.disconnect();
+                    img._pyfcsLegendMutationObserver = null;
+                }}
+
+                if (img._pyfcsLegendResizeObserver) {{
+                    img._pyfcsLegendResizeObserver.disconnect();
+                    img._pyfcsLegendResizeObserver = null;
+                }}
+
+                img._pyfcsLegendFollowInstalled = false;
+            }})();
+        """)
+
+
+    def _show_legend_window(self, window_id: str, labels, colors, info=None, mode='all'):
+        """
+        Show the legend in a separate floating window attached to the image window.
+        """
+
+        if not hasattr(self, "legend_windows"):
+            self.legend_windows = {}
+
+        # Remove previous follow hooks before recreating the legend.
+        self._uninstall_legend_follow_behavior(window_id)
+
+        # Remove existing legend window
+        if window_id in self.legend_windows:
+            old = self.legend_windows[window_id]
+            if old:
+                old.delete()
+            self.legend_windows.pop(window_id, None)
+
+        img_win = self.image_windows.get(window_id)
+        if not img_win:
+            return
+
+        legend_id = f"{window_id}_legend"
+
+        with self.image_workspace:
+            legend_card = ui.card().props(f'id={legend_id}').style(
+                'position:absolute; left:400px; top:100px; '
+                'width:160px; max-height:300px; overflow:auto; z-index:2001;'
+            )
+
+            with legend_card:
+                ui.label("Legend").classes("text-sm font-bold")
+
+                for lab in labels:
+                    rgb = colors.get(lab, np.array([0, 0, 0], dtype=np.uint8))
+                    hexcol = f'#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}'
+
+                    with ui.row().classes("items-center gap-2"):
+                        ui.html(
+                            f'<div style="width:16px;height:16px;background:{hexcol};border:1px solid #000;"></div>',
+                            sanitize=False,
+                        )
+                        ui.label(lab).classes("text-xs")
+
+                if info:
+                    ui.separator()
+                    ui.label(info).classes("text-xs text-gray-600")
+
+                # Show Alt. Colors only for full Color Mapping All mode.
+                if mode == 'all':
+                    ui.separator()
+                    ui.button(
+                        'Alt. Colors',
+                        on_click=lambda wid=window_id: self.toggle_color_scheme(wid),
+                    ).props('dense')
+
+        self.legend_windows[window_id] = legend_card
+
+        # CHANGED:
+        # Use plain JS timeout instead of ui.timer so it does not depend on the
+        # current NiceGUI slot (which may belong to a deleted legend button).
+        ui.run_javascript(f"""
+            setTimeout(() => {{
+                const img = document.getElementById("{window_id}");
+                const legend = document.getElementById("{legend_id}");
+                if (!img || !legend) return;
+
+                const imgLeft = parseFloat(img.style.left || '0');
+                const imgTop = parseFloat(img.style.top || '0');
+                const imgWidth = img.offsetWidth || 0;
+
+                legend.style.left = (imgLeft + imgWidth + 10) + 'px';
+                legend.style.top = imgTop + 'px';
+
+                if (img._pyfcsLegendMutationObserver) {{
+                    img._pyfcsLegendMutationObserver.disconnect();
+                    img._pyfcsLegendMutationObserver = null;
+                }}
+                if (img._pyfcsLegendResizeObserver) {{
+                    img._pyfcsLegendResizeObserver.disconnect();
+                    img._pyfcsLegendResizeObserver = null;
+                }}
+
+                const syncLegend = () => {{
+                    const left = parseFloat(img.style.left || '0');
+                    const top = parseFloat(img.style.top || '0');
+                    const width = img.offsetWidth || 0;
+                    legend.style.left = (left + width + 10) + 'px';
+                    legend.style.top = top + 'px';
+                }};
+
+                const observer = new MutationObserver(syncLegend);
+                observer.observe(img, {{
+                    attributes: true,
+                    attributeFilter: ['style', 'class']
+                }});
+
+                const resizeObserver = new ResizeObserver(syncLegend);
+                resizeObserver.observe(img);
+
+                img._pyfcsLegendMutationObserver = observer;
+                img._pyfcsLegendResizeObserver = resizeObserver;
+                img._pyfcsLegendFollowInstalled = true;
+            }}, 60);
+        """)
 
 
 
