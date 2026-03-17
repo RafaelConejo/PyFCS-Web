@@ -18,12 +18,12 @@ class Prototype:
 
     def __init__(self, label, positive, negatives, voronoi_volume=None, add_false=False):
         self.label = label
-        self.positive = positive
-        self.negatives = negatives
+        self.positive = np.asarray(positive, dtype=float).reshape(3,)
+        self.negatives = np.asarray(negatives, dtype=float).reshape(-1, 3)
         self.add_false = add_false
 
         if add_false:
-            self.negatives = np.vstack((self.negatives, Prototype.false_negatives))
+            self.negatives = np.vstack((self.negatives, Prototype.false_negatives)).astype(float)
 
         if voronoi_volume is not None:
             self.voronoi_volume = voronoi_volume
