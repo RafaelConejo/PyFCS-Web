@@ -50,17 +50,17 @@ class Prototype:
             If qvoronoi fails or returns no output.
         """
         try:
-            points = np.vstack((self.positive, self.negatives))
-            output = qvoronoi("Fi Fo p Fv", points)
+            points = np.vstack((self.positive, self.negatives)).astype(float)
 
-            if output is None:
-                raise RuntimeError("qvoronoi returned None")
+            points_for_qhull = [
+                [float(x), float(y), float(z)]
+                for x, y, z in points
+            ]
 
-            if isinstance(output, list) and len(output) == 0:
-                raise RuntimeError("qvoronoi returned an empty list")
+            output = qvoronoi("Fi Fo p Fv", points_for_qhull)
 
-            if isinstance(output, str) and not output.strip():
-                raise RuntimeError("qvoronoi returned an empty string")
+            if not output:
+                raise RuntimeError("qvoronoi returned empty output")
 
             return output
 
