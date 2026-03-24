@@ -45,6 +45,12 @@ class PyFCSWebApp:
         # Flag indicating whether a color space is currently loaded/active
         self.COLOR_SPACE = False
 
+        self.is_loading_color_space = False     # Flag indicating a FCS is loading
+        self.bulk_updating_colors = False       # Flag to avoid triggering callbacks during bulk checkbox updates
+        self.color_checkboxes = {}              # Dict: color_name -> checkbox reference (UI state control)
+        self.loading_dialog = None              # Reference to the loading dialog (created once and reused)
+        self.loading_label = None               # Label inside loading dialog to show current operation message
+
         # Lower value = faster mapping.
         self.PREVIEW_MAX_SIDE = 256
 
@@ -312,23 +318,23 @@ class PyFCSWebApp:
                 # File menu (web "exit" just shows a dialog)
                 with ui.menu():
                     ui.menu_item('Exit', on_click=self.exit_app)
-                    ui.button('File', icon='menu').props('flat')
+                    self.btn_file_menu = ui.button('File', icon='menu').props('flat')
 
                 # Image manager menu
                 with ui.menu():
                     ui.menu_item('Open Image', on_click=self.open_image)
                     ui.menu_item('Save Image', on_click=self.save_image)
                     ui.menu_item('Close All', on_click=self.close_all_image)
-                    ui.button('Image Manager', icon='image').props('flat')
+                    self.btn_image_manager_menu = ui.button('Image Manager', icon='image').props('flat')
 
                 # Fuzzy color space menu
                 with ui.menu():
                     ui.menu_item('New Color Space', on_click=self.show_menu_create_fcs)
                     ui.menu_item('Load Color Space', on_click=self.load_color_space)
-                    ui.button('Fuzzy Color Space', icon='palette').props('flat')
+                    self.btn_fuzzy_color_space_menu = ui.button('Fuzzy Color Space', icon='palette').props('flat')
 
                 # About action
-                ui.button('About', on_click=self.about_info).props('flat')
+                self.btn_about = ui.button('About', on_click=self.about_info).props('flat')
 
         # ---- Toolbar cards (without "Color Evaluation" section) ----
         with ui.row().classes('w-full q-pa-md items-start gap-4'):
@@ -336,15 +342,15 @@ class PyFCSWebApp:
             with ui.card().classes('w-[350px] q-pa-md'):
                 ui.label('Image Manager').classes('font-bold')
                 with ui.row().classes('gap-2'):
-                    ui.button('Open Image', icon='folder_open', on_click=self.open_image)
-                    ui.button('Save Image', icon='save', on_click=self.save_image)
+                    self.btn_open_image = ui.button('Open Image', icon='folder_open', on_click=self.open_image)
+                    self.btn_save_image = ui.button('Save Image', icon='save', on_click=self.save_image)
 
             # Fuzzy Color Space Manager (wider)
             with ui.card().classes('w-[450px] q-pa-md'):
                 ui.label('Fuzzy Color Space Manager').classes('font-bold')
                 with ui.row().classes('gap-2 items-center'):
-                    ui.button('New Color Space', icon='add', on_click=self.show_menu_create_fcs)
-                    ui.button('Load Color Space', icon='upload_file', on_click=self.load_color_space)
+                    self.btn_new_color_space = ui.button('New Color Space', icon='add', on_click=self.show_menu_create_fcs)
+                    self.btn_load_color_space = ui.button('Load Color Space', icon='upload_file', on_click=self.load_color_space)
 
         # ---- Main split (full height minus header+toolbar) ----
         with ui.splitter(value=30).classes('w-full h-[calc(100vh-150px)] q-pa-md') as splitter:
@@ -387,8 +393,8 @@ class PyFCSWebApp:
                             with inner.after:
                                 with ui.card().classes('w-full h-full'):
                                     with ui.row().classes('justify-end gap-2 q-pa-sm'):
-                                        ui.button('Select All', on_click=self.select_all_color)
-                                        ui.button('Deselect All', on_click=self.deselect_all_color)
+                                        self.btn_select_all = ui.button('Select All', on_click=self.select_all_color)
+                                        self.btn_deselect_all = ui.button('Deselect All', on_click=self.deselect_all_color)
 
                                     self.colors_scroll = ui.scroll_area().classes('w-full h-[calc(100%-56px)] q-pa-sm')
                                     with self.colors_scroll:
@@ -430,6 +436,28 @@ class PyFCSWebApp:
                         #     ui.button('Apply Changes', on_click=self.apply_changes)
 
     # ---------- UI helpers ----------
+    def set_ui_busy(self, busy: bool):
+        widgets = [
+            getattr(self, 'btn_file_menu', None),
+            getattr(self, 'btn_image_manager_menu', None),
+            getattr(self, 'btn_fuzzy_color_space_menu', None),
+            getattr(self, 'btn_about', None),
+            getattr(self, 'btn_open_image', None),
+            getattr(self, 'btn_save_image', None),
+            getattr(self, 'btn_new_color_space', None),
+            getattr(self, 'btn_load_color_space', None),
+            getattr(self, 'btn_select_all', None),
+            getattr(self, 'btn_deselect_all', None),
+        ]
+
+        for widget in widgets:
+            if widget is None:
+                continue
+            if busy:
+                widget.disable()
+            else:
+                widget.enable()
+
     def set_color_list(self, color_names: list[str]) -> None:
         """
         (Re)create the checkbox list shown in the right panel and refresh plot state on change.
@@ -440,7 +468,11 @@ class PyFCSWebApp:
         - Creates one checkbox per color
         - Stores both the UI checkbox and the persisted enabled/disabled value
         """
-        self.color_checkboxes.clear()
+        if not hasattr(self, 'color_checkboxes') or not isinstance(self.color_checkboxes, dict):
+            self.color_checkboxes = {}
+        else:
+            self.color_checkboxes.clear()
+
         self.colors_scroll.clear()
 
         # Ensure MEMBERDEGREE exists and is a dictionary
@@ -486,6 +518,14 @@ class PyFCSWebApp:
         # Persist state
         self.MEMBERDEGREE[name] = value
 
+        # Avoid triggering many refreshes during bulk updates
+        if getattr(self, 'bulk_updating_colors', False):
+            return
+
+        # Ignore updates while color space is loading
+        if getattr(self, 'is_loading_color_space', False):
+            return
+
         # Recompute "selected_*" collections (based on current enabled colors)
         self.update_selected_sets_from_checks()
 
@@ -525,12 +565,14 @@ class PyFCSWebApp:
     # ---------- Web equivalents of your Tkinter utils ----------
     def custom_warning(self, title="Warning", message="Warning"):
         """Show a simple modal warning dialog."""
-        with ui.dialog() as d, ui.card():
+        with ui.dialog() as d, ui.card().classes('w-[600px] max-w-full'):
             ui.label(title).classes('text-lg font-bold')
-            ui.label(message).classes('text-gray-700')
+            ui.label(message).classes('text-gray-700').style('white-space: pre-wrap; word-break: break-word;')
             with ui.row().classes('justify-end'):
                 ui.button('OK', on_click=d.close)
         d.open()
+
+
 
     def show_loading(self, message="Processing..."):
         """
@@ -551,9 +593,13 @@ class PyFCSWebApp:
 
         self.loading_dialog.open()
 
+
+
     def show_loading_color_space(self):
         """Convenience wrapper for a standardized loading message."""
         self.show_loading("Loading Color Space...")
+
+
 
     def set_loading_progress(self, value_0_to_1: float):
         """
@@ -564,10 +610,13 @@ class PyFCSWebApp:
             self.loading_progress.props(remove='indeterminate')
             self.loading_progress.set_value(round(max(0.0, min(1.0, value_0_to_1)), 2))
 
+
+
     def hide_loading(self):
         """Close the loading dialog if it exists."""
         if self.loading_dialog is not None:
             self.loading_dialog.close()
+        self.set_ui_busy(False)
 
     # ---------- callbacks ----------
     def exit_app(self):
@@ -601,6 +650,10 @@ class PyFCSWebApp:
         Entry point for creating a new fuzzy color space in the web UI.
         Current behavior: directly opens palette-based creation (stub).
         """
+        if getattr(self, 'is_loading_color_space', False):
+            ui.notify('Please wait until the current operation finishes.', color='warning')
+            return
+
         self.palette_based_creation()
 
         # Alternative dialog-based selector (kept commented as reference)
@@ -617,18 +670,30 @@ class PyFCSWebApp:
     # ----- still-stubs (to be implemented later) -----
     def open_image(self):
         """Open Image action (placeholder)."""
+        if getattr(self, 'is_loading_color_space', False):
+            ui.notify('Please wait until the current operation finishes.', color='warning')
+            return
         ui.notify('Open Image (stub)')
 
     def save_image(self):
         """Save Image action (placeholder)."""
+        if getattr(self, 'is_loading_color_space', False):
+            ui.notify('Please wait until the current operation finishes.', color='warning')
+            return
         ui.notify('Save Image (stub)')
 
     def close_all_image(self):
         """Close all images action (placeholder)."""
+        if getattr(self, 'is_loading_color_space', False):
+            ui.notify('Please wait until the current operation finishes.', color='warning')
+            return
         ui.notify('Close All (stub)')
 
     def load_color_space(self):
         """Load fuzzy color space action (placeholder)."""
+        if getattr(self, 'is_loading_color_space', False):
+            ui.notify('A file is already being loaded, please wait.', color='warning')
+            return
         ui.notify('Load Color Space (stub)')
 
     def palette_based_creation(self):
@@ -653,13 +718,37 @@ class PyFCSWebApp:
 
     def select_all_color(self):
         """Set all color checkboxes to True (enabled)."""
-        for cb in self.color_checkboxes.values():
-            cb.set_value(True)
+        if getattr(self, 'is_loading_color_space', False):
+            ui.notify('Please wait until the current operation finishes.', color='warning')
+            return
+
+        self.bulk_updating_colors = True
+        try:
+            for name, cb in self.color_checkboxes.items():
+                cb.set_value(True)
+                self.MEMBERDEGREE[name] = True
+        finally:
+            self.bulk_updating_colors = False
+
+        self.update_selected_sets_from_checks()
+        self.on_option_select()
 
     def deselect_all_color(self):
         """Set all color checkboxes to False (disabled)."""
-        for cb in self.color_checkboxes.values():
-            cb.set_value(False)
+        if getattr(self, 'is_loading_color_space', False):
+            ui.notify('Please wait until the current operation finishes.', color='warning')
+            return
+
+        self.bulk_updating_colors = True
+        try:
+            for name, cb in self.color_checkboxes.items():
+                cb.set_value(False)
+                self.MEMBERDEGREE[name] = False
+        finally:
+            self.bulk_updating_colors = False
+
+        self.update_selected_sets_from_checks()
+        self.on_option_select()
 
     def set_model_option(self, name, value):
         """
@@ -673,6 +762,13 @@ class PyFCSWebApp:
             New checkbox value.
         """
         self.model_3d_options[name] = value
+
+        if getattr(self, 'is_loading_color_space', False):
+            return
+
+        if not getattr(self, 'COLOR_SPACE', False):
+            return
+
         self.on_option_select()
 
 
@@ -696,157 +792,165 @@ class PyFCSWebApp:
         Open a modal dialog that lets the user load a color space in two ways:
         1) Load a preset .fcs file already available on the server.
         2) Upload a local .cns or .fcs file from the user's computer.
-
-        This is one of the main features of the PyFCS Web Lite demo:
-        it connects the web UI to the existing PyFCS parsers and then triggers
-        the 3D visualization / data table refresh.
         """
-        # Get available preset FCS files shipped with the web app
         presets = self.list_preset_fcs()
 
-        # Build the loading dialog
         with ui.dialog() as d, ui.card().classes('w-[560px]'):
             ui.label('Load Color Space').classes('text-lg font-bold')
 
-            # --- Presets section ---
+            # estado local de widgets para poder bloquearlos
+            load_preset_btn = None
+            upload_widget = None
+            cancel_btn = None
+
             if presets:
                 ui.label('Load a preset (.fcs) from the server:').classes('text-sm text-gray-700')
 
-                # Dropdown to pick which preset to load
                 preset_select = ui.select(
                     options=list(presets.keys()),
                     value=list(presets.keys())[0],
                     label='Presets',
                 ).classes('w-full')
 
-                # Action buttons
                 with ui.row().classes('justify-end gap-2'):
-                    ui.button(
+                    load_preset_btn = ui.button(
                         'Load preset',
                         icon='cloud_download',
-                        # Close dialog and load the selected preset path
-                        on_click=lambda: (d.close(), self.load_color_space_from_path(presets[preset_select.value]))
+                        on_click=lambda: self._handle_preset_load(
+                            d,
+                            presets[preset_select.value],
+                            load_preset_btn,
+                            upload_widget,
+                            cancel_btn
+                        )
                     )
             else:
                 ui.label('No presets found on the server.').classes('text-sm text-gray-500')
 
             ui.separator()
 
-            # --- Upload section ---
             ui.label('Or upload a .cns/.fcs file:').classes('text-sm text-gray-700')
 
-            # NiceGUI upload will immediately upload and call the handler
-            ui.upload(
+            upload_widget = ui.upload(
                 label='Choose file',
                 multiple=False,
                 auto_upload=True,
-                on_upload=lambda e: self._on_color_file_uploaded(e, d),
+                on_upload=lambda e: self._on_color_file_uploaded(
+                    e, d, load_preset_btn, upload_widget, cancel_btn
+                ),
             ).props('accept=.cns,.fcs')
 
-            # Cancel closes the dialog without doing anything
             with ui.row().classes('justify-end'):
-                ui.button('Cancel', on_click=d.close).props('flat')
+                cancel_btn = ui.button('Cancel', on_click=d.close).props('flat')
 
         d.open()
+
+
+    def _set_load_dialog_enabled(self, enabled, *widgets):
+        for widget in widgets:
+            if widget is None:
+                continue
+            if enabled:
+                widget.enable()
+            else:
+                widget.disable()
+
+
+    def _handle_preset_load(self, dialog, filepath, *widgets):
+        if self.is_loading_color_space:
+            ui.notify('A file is already being loaded, please wait.', color='warning')
+            return
+
+        self._set_load_dialog_enabled(False, *widgets)
+        dialog.close()
+        self.load_color_space_from_path(filepath)
+
+
 
     def load_color_space_from_path(self, filepath: str):
         """
         Load a color space file from a server-side path (preset).
-
-        This method:
-        - Shows a loading dialog
-        - Uses FuzzyColorSpaceManager.load_color_file() to parse the file
-        - Updates UI state: file name, data table, and 3D model plot
-        - For .cns: constructs the fuzzy color space (volumes) on the fly
-        - For .fcs: loads the full fuzzy color space including prototypes/cores/supports
         """
+        if self.is_loading_color_space:
+            ui.notify('A file is already being loaded, please wait.', color='warning')
+            return
+
+        self.is_loading_color_space = True
         self.show_loading_color_space()
+
         try:
-            # Parse file using the existing PyFCS input system
             data = self.fuzzy_manager.load_color_file(filepath)
 
-            # Store reference info for UI / plots
             self.file_path = filepath
             self.file_base_name = os.path.splitext(os.path.basename(filepath))[0]
             self.file_name.set_value(self.file_base_name)
 
-            # CNS: only raw color data -> compute volumes and then update UI
             if data['type'] == 'cns':
                 self.color_data = data['color_data']
                 self.display_data_window()
                 self.update_volumes()
 
-            # FCS: full fuzzy color space -> use precomputed structures
             elif data['type'] == 'fcs':
                 self.color_data = data['color_data']
                 self.fuzzy_color_space = data['fuzzy_color_space']
 
-                # Extract structures needed by the 3D visualizations
                 self.cores = self.fuzzy_color_space.cores
                 self.supports = self.fuzzy_color_space.supports
                 self.prototypes = self.fuzzy_color_space.prototypes
 
-                # Precompute cached geometry / membership structures (as in desktop)
                 self.fuzzy_color_space.precompute_pack()
 
-                # Refresh UI
                 self.display_data_window()
                 self.update_prototypes_info()
 
             ui.notify('Loaded preset successfully')
 
         except Exception as ex:
-            # Any parsing/IO errors are displayed to the user
             self.custom_warning('File Error', str(ex))
-        finally:
-            # Always close the loading dialog
-            self.hide_loading()
 
-    async def _on_color_file_uploaded(self, e, dialog):
+        finally:
+            self.hide_loading()
+            self.is_loading_color_space = False
+            if getattr(self, 'COLOR_SPACE', False):
+                self.on_option_select()
+
+
+
+    async def _on_color_file_uploaded(self, e, dialog, *widgets):
         """
         NiceGUI upload callback (client -> server).
-
-        Workflow:
-        - Close the selection dialog
-        - Read uploaded file bytes from the browser (await e.file.read())
-        - Save to a temporary file (so existing PyFCS parsers can be reused unchanged)
-        - Parse using FuzzyColorSpaceManager.load_color_file()
-        - Update app state and refresh the 3D plot + data table
-        - Remove the temporary file at the end
         """
-        # Close the upload dialog immediately
+        if self.is_loading_color_space:
+            ui.notify('A file is already being loaded, please wait.', color='warning')
+            return
+
+        self.is_loading_color_space = True
+        self._set_load_dialog_enabled(False, *widgets)
+
         dialog.close()
         self.show_loading_color_space()
 
         tmp_path = None
         try:
-            # Original name is shown in UI, but we parse from a temporary file
             original_name = e.file.name
-
-            # IMPORTANT: read file content as bytes from the browser upload
             content_bytes = await e.file.read()
 
-            # Keep the original extension so the parser can detect type
             suffix = os.path.splitext(original_name)[1].lower() or '.tmp'
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                 tmp.write(content_bytes)
                 tmp_path = tmp.name
 
-            # Reuse the same parser logic as desktop
             data = self.fuzzy_manager.load_color_file(tmp_path)
 
-            # Update state used by plots/tables
             self.file_path = original_name
             self.file_base_name = os.path.splitext(os.path.basename(original_name))[0]
             self.file_name.set_value(self.file_base_name)
 
-            # CNS: compute volumes from prototypes
             if data['type'] == 'cns':
                 self.color_data = data['color_data']
                 self.display_data_window()
                 self.update_volumes()
 
-            # FCS: load full fuzzy color space and precompute pack
             elif data['type'] == 'fcs':
                 self.color_data = data['color_data']
                 self.fuzzy_color_space = data['fuzzy_color_space']
@@ -864,41 +968,44 @@ class PyFCSWebApp:
             self.custom_warning("File Error", str(ex))
 
         finally:
-            # Ensure loading dialog is closed and temp file is removed
             self.hide_loading()
+            self.is_loading_color_space = False
+
+            if getattr(self, 'COLOR_SPACE', False):
+                self.on_option_select()
+
             if tmp_path:
                 try:
                     os.remove(tmp_path)
                 except Exception:
                     pass
 
+
+
     def update_volumes(self):
         """
         Compute fuzzy color space volumes from raw color data (.cns).
-
-        This mirrors the desktop workflow:
-        - Convert parsed color_data into Prototype objects
-        - Build a FuzzyColorSpace instance
-        - Run precompute_pack() to prepare internal structures
-        - Compute cores and supports
-        - Update selection state and refresh the plot
         """
         self.show_loading("Computing volumes...")
 
-        # Same calls used in the desktop application
-        self.prototypes = UtilsTools.process_prototypes(self.color_data)
+        try:
+            self.prototypes = UtilsTools.process_prototypes(self.color_data)
 
-        # Build fuzzy color space and precompute
-        self.fuzzy_color_space = FuzzyColorSpace(space_name=" ", prototypes=self.prototypes)
-        self.fuzzy_color_space.precompute_pack()
+            self.fuzzy_color_space = FuzzyColorSpace(
+                space_name=" ",
+                prototypes=self.prototypes
+            )
+            self.fuzzy_color_space.precompute_pack()
 
-        # In desktop, cores/supports are computed using getter methods
-        self.cores = self.fuzzy_color_space.get_cores()
-        self.supports = self.fuzzy_color_space.get_supports()
+            self.cores = self.fuzzy_color_space.get_cores()
+            self.supports = self.fuzzy_color_space.get_supports()
 
-        # Refresh selection state + plots
-        self.update_prototypes_info()
-        self.hide_loading()
+            self.update_prototypes_info()
+
+        finally:
+            self.hide_loading()
+
+
 
     def update_prototypes_info(self):
         """
@@ -961,7 +1068,13 @@ class PyFCSWebApp:
         If no options are selected, the plot area is cleared.
         Otherwise, it calls VisualManager.plot_more_combined_3D() and renders it via ui.plotly().
         """
-        if not self.COLOR_SPACE:
+        if not getattr(self, 'COLOR_SPACE', False):
+            return
+
+        if getattr(self, 'is_loading_color_space', False):
+            return
+
+        if getattr(self, 'bulk_updating_colors', False):
             return
 
         # Which layers the user wants to display
@@ -973,7 +1086,6 @@ class PyFCSWebApp:
             return
 
         try:
-            # Generate the Plotly figure (same VisualManager logic as desktop)
             fig = VisualManager.plot_more_combined_3D(
                 self.file_base_name,
                 self.selected_centroids,
@@ -986,11 +1098,9 @@ class PyFCSWebApp:
                 filtered_points=getattr(self, 'filtered_points', None),
             )
 
-            # Render figure into the UI
             self.draw_model_3D(fig, selected_options)
 
         except Exception as ex:
-            # Plotly/geometry errors are shown as a dialog
             self.custom_warning("Plot Error", str(ex))
 
     def draw_model_3D(self, fig, selected_options):
@@ -1009,7 +1119,7 @@ class PyFCSWebApp:
             if fig is None:
                 ui.label('No 3D option selected').classes('text-gray-500')
             else:
-                ui.plotly(fig).classes('w-full h-full')
+                self.plot_widget = ui.plotly(fig).classes('w-full h-full')
 
 
 
@@ -1042,68 +1152,58 @@ class PyFCSWebApp:
         - LAB values are taken from `positive_prototype` when available, otherwise from `Color`.
         - LAB -> RGB conversion may produce NaNs for invalid LAB; in that case a black fallback is used.
         """
-        # 1) Fill the Name field (if the base name exists)
         if hasattr(self, 'file_base_name') and self.file_base_name:
             self.file_name.set_value(self.file_base_name)
 
-        # 2) Reset containers (mirrors desktop behavior)
-        self.hex_color = {}      # HEX -> LAB
-        self.color_matrix = []   # ordered list of color names (for checkboxes)
+        self.hex_color = {}
+        self.color_matrix = []
 
         rows = []
 
-        # 3) Iterate over the loaded color_data dictionary:
-        #    self.color_data = { color_name: {'positive_prototype': [L,a,b], ...}, ... }
         for color_name, color_value in (self.color_data or {}).items():
+            if not isinstance(color_value, dict):
+                continue
 
-            # Prefer 'positive_prototype', but keep compatibility with alternative key 'Color'
             lab = color_value.get('positive_prototype', None)
             if lab is None:
                 lab = color_value.get('Color', None)
 
-            # Normalize to a 1D (3,) float array
-            lab = np.array(lab, dtype=float).reshape(3,)
+            if lab is None:
+                continue
+
+            try:
+                lab = np.array(lab, dtype=float).reshape(3,)
+            except Exception:
+                continue
+
             self.color_matrix.append(color_name)
 
-            # Convert LAB -> RGB in [0, 1] (skimage expects shape (1,1,3))
-            rgb01 = skcolor.lab2rgb(lab.reshape(1, 1, 3))[0, 0, :]
+            try:
+                rgb01 = skcolor.lab2rgb(lab.reshape(1, 1, 3))[0, 0, :]
+            except Exception:
+                rgb01 = np.array([0.0, 0.0, 0.0])
 
-            # If conversion produced invalid values (e.g., NaNs), fall back to black
             if not np.all(np.isfinite(rgb01)):
                 rgb01 = np.array([0.0, 0.0, 0.0])
 
-            # Clip to valid range and convert to 0..255 (use rounding, not truncation)
             rgb01 = np.clip(rgb01, 0.0, 1.0)
             rgb255 = tuple(int(round(c * 255.0)) for c in rgb01)
 
-            # Build HEX representation for UI swatches
             hex_color = f'#{rgb255[0]:02x}{rgb255[1]:02x}{rgb255[2]:02x}'
 
-            # Store mapping used by plotting / other modules (HEX -> LAB)
             self.hex_color[hex_color] = lab
 
-            # Optional HTML preview (kept here as reference; the table uses the HEX value slot renderer)
-            preview = f'''
-            <div style="
-                width:110px;height:24px;border:1px solid #000;
-                background:{hex_color};margin:auto;border-radius:4px;">
-            </div>
-            '''
-
-            # Add a row to the Data table
             rows.append({
                 'L': round(float(lab[0]), 2),
                 'a': round(float(lab[1]), 2),
                 'b': round(float(lab[2]), 2),
                 'name': color_name,
-                'color': hex_color,   # IMPORTANT: keep only the HEX string (slot renders the swatch)
+                'color': hex_color,
             })
 
-        # 4) Push rows into the NiceGUI table and refresh
         self.data_table.rows = rows
         self.data_table.update()
 
-        # 5) Update the right-side checkbox list to match the loaded colors
         self.set_color_list(self.color_matrix)
 
 
@@ -1778,6 +1878,7 @@ class PyFCSWebApp:
         self.show_loading("Loading image...")
 
         tmp_path = None
+        tmp_dir = None
         try:
             original_name = e.file.name
             content_bytes = await e.file.read()
@@ -1793,21 +1894,26 @@ class PyFCSWebApp:
                 f.write(content_bytes)
 
             # Open the uploaded image in a floating window
-            self.create_floating_window(tmp_path, display_name=original_name)
+            self.create_floating_window(
+                tmp_path,
+                display_name=original_name,
+                temp_dir=tmp_dir,
+            )
 
         except Exception as ex:
             self.custom_warning("Image Error", str(ex))
         finally:
             self.hide_loading()
 
-
-
-    def create_floating_window(self, filename: str, display_name: str | None = None):
+    def create_floating_window(self, filename: str, display_name: str | None = None, temp_dir: str | None = None):
         """
         Create a web "floating window" for an image.
         """
         if not hasattr(self, "image_windows"):
             self.image_windows = {}
+
+        if not hasattr(self, "_image_window_counter"):
+            self._image_window_counter = 0
 
         if not hasattr(self, "label_map_cache"):
             self.label_map_cache = {}
@@ -1824,7 +1930,10 @@ class PyFCSWebApp:
         if not hasattr(self, "best_idx_cache"):
             self.best_idx_cache = {}
 
-        window_id = f"img_{len(self.image_windows) + 1}"
+        # CHANGED: monotonic unique window ids to avoid reuse
+        self._image_window_counter += 1
+        window_id = f"img_{self._image_window_counter}"
+
         title = display_name or os.path.basename(filename)
 
         if not hasattr(self, "ORIGINAL_IMG"):
@@ -1853,6 +1962,10 @@ class PyFCSWebApp:
             "legend_info": None,
             "alt_colors_btn": None,
             "legend_visible": False,
+
+            # CHANGED: track temp upload folder for cleanup
+            "temp_dir": temp_dir,
+            "is_temp": temp_dir is not None,
 
             # CHANGED: persist floating position
             "x": x0,
@@ -1949,8 +2062,6 @@ class PyFCSWebApp:
             }}, 50);
         """)
 
-
-
     def _remember_window_position(self, window_id: str):
         """
         Read the current DOM position of the floating image window and store it in Python.
@@ -1967,7 +2078,6 @@ class PyFCSWebApp:
                 window.pyfcsWindowPos["{window_id}"] = {{ x, y }};
             }})()
         """)
-
 
     def _install_position_observer(self, window_id: str):
         """
@@ -1998,7 +2108,6 @@ class PyFCSWebApp:
             }})();
         """)
 
-
     def _restore_window_position(self, window_id: str):
         """
         Restore floating position from Python state.
@@ -2021,7 +2130,6 @@ class PyFCSWebApp:
             }})()
         """)
 
-
     def _sync_window_position_from_browser(self, window_id: str):
         """
         Pull the latest browser-stored position into Python state.
@@ -2033,7 +2141,6 @@ class PyFCSWebApp:
                 window.__pyfcs_last_pos = pos;
             }})()
         """)
-
 
     def toggle_legend(self, window_id: str):
         """
@@ -2115,13 +2222,20 @@ class PyFCSWebApp:
         if hasattr(self, "MEMBERDEGREE_IMG") and window_id in self.MEMBERDEGREE_IMG:
             del self.MEMBERDEGREE_IMG[window_id]
 
+        # CHANGED: cleanup temporary upload folder if this image came from browser upload
+        temp_dir = win.get("temp_dir")
+        if temp_dir and os.path.isdir(temp_dir):
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
         # 5) Delete the image card LAST
         if win.get("card") is not None:
             win["card"].delete()
 
         # 6) Remove registry entry at the very end
         del self.image_windows[window_id]
-
 
     def _make_preview_data_url_from_path(self, path: str, max_side: int) -> str:
         """
@@ -2144,7 +2258,6 @@ class PyFCSWebApp:
 
         return self._np_to_data_url(np.array(img, dtype=np.uint8))
     
-
     def _on_window_moved(self, window_id: str, e):
         """
         Persist the dragged floating window position in Python state and server-side style.
@@ -2177,14 +2290,6 @@ class PyFCSWebApp:
 
         except Exception as ex:
             self.custom_warning("Move Error", str(ex))
-
-
-
-
-
-
-
-
 
     # -------------------------------------------------------------------------
     # IMAGE PROCESSING / MAPPING FUNCTIONS (PyFCS Web Lite)
@@ -2226,7 +2331,6 @@ class PyFCSWebApp:
 
         except Exception as e:
             self.custom_warning("Display Error", str(e))
-
 
     def color_mapping(self, window_id: str):
         """
@@ -2359,8 +2463,6 @@ class PyFCSWebApp:
                 ui.button('Apply', icon='palette', on_click=_apply)
         d.open()
 
-
-
     def _np_to_data_url(self, arr_uint8: np.ndarray) -> str:
         """
         Convert an RGB uint8 numpy array into a PNG data URL.
@@ -2442,9 +2544,7 @@ class PyFCSWebApp:
                 rgb255 = np.array([0, 0, 0], dtype=np.uint8)
 
             out[lab] = rgb255
-
         return out
-
 
     def _compute_label_map(self, img_uint8: np.ndarray, progress_callback=None) -> np.ndarray:
         """
@@ -2479,7 +2579,6 @@ class PyFCSWebApp:
 
         label_map = best_for_uniq[inv].reshape(h, w).astype(np.int32)
         return label_map
-
 
     def color_mapping_all(self, window_id: str):
         """
@@ -2578,8 +2677,6 @@ class PyFCSWebApp:
 
         asyncio.create_task(_run())
 
-        
-
     def _get_work_image_np(self, window_id: str, max_side: int) -> np.ndarray:
         """
         Load the image window file into a resized numpy array (uint8 RGB).
@@ -2609,12 +2706,10 @@ class PyFCSWebApp:
 
         return np.array(img, dtype=np.uint8)
 
-
     def _render_legend(self, window_id: str, only_labels=None, info=None, mode='all'):
         """
         Render legend in a separate floating window.
         """
-
         scheme = self.scheme_cache.get(window_id, 'centroid')
         colors = self._label_colors_centroid() if scheme == 'centroid' else self._label_colors_hsv()
 
@@ -2624,7 +2719,6 @@ class PyFCSWebApp:
         # Pass mode through so the separate legend window knows whether to show
         # the Alt. Colors button (only for full Color Mapping All mode).
         self._show_legend_window(window_id, labels, colors, info, mode=mode)
-
 
     def toggle_color_scheme(self, window_id: str):
         """
@@ -2670,7 +2764,6 @@ class PyFCSWebApp:
         self._restore_window_position(window_id)
         self._render_legend(window_id)
 
-
     def _proto_index_by_label(self, label: str) -> int:
         """
         Return the index of a Prototype in self.prototypes matching the given label.
@@ -2684,8 +2777,6 @@ class PyFCSWebApp:
             if getattr(p, 'label', None) == label:
                 return i
         raise ValueError(f'Prototype not found: {label}')
-
-
 
     def _membership_map_for_prototype(self, img_np_rgb255: np.ndarray, proto_index: int, progress_cb=None) -> np.ndarray:
         """
@@ -2725,14 +2816,12 @@ class PyFCSWebApp:
         gray = np.clip(gray, 0, 255).astype(np.uint8)
         return gray
 
-
     def _image_hash(self, arr: np.ndarray) -> str:
         """
         Stable hash for a preview image numpy array.
         Used to cache mapping results by actual preview content.
         """
         return hashlib.blake2b(arr.tobytes(), digest_size=16).hexdigest()
-
 
     def _quantize_lab(self, lab_img: np.ndarray) -> np.ndarray:
         """
@@ -2743,7 +2832,6 @@ class PyFCSWebApp:
         """
         step = float(getattr(self, 'LAB_QUANT_STEP', 0.05))
         return np.round(lab_img / step) * step
-
 
     def _prepare_window_preview_cache(self, window_id: str):
         """
@@ -2795,7 +2883,6 @@ class PyFCSWebApp:
         win["preview_w"] = w
         win["preview_cache_ready"] = True
 
-
     def _palette_centroid_uint8(self) -> np.ndarray:
         """
         Build a palette array (N,3) uint8 in self.prototypes order using centroid colors.
@@ -2824,7 +2911,6 @@ class PyFCSWebApp:
 
         return np.stack(palette, axis=0).astype(np.uint8)
 
-
     def _palette_hsv_uint8(self) -> np.ndarray:
         """
         Build a palette array (N,3) uint8 in self.prototypes order using HSV colors.
@@ -2843,14 +2929,12 @@ class PyFCSWebApp:
 
         return np.stack(palette, axis=0).astype(np.uint8)
 
-
     def _prototype_signature(self) -> tuple:
         """
         Signature of current prototype set / order.
         Used to invalidate caches safely when prototypes change.
         """
         return tuple(getattr(p, 'label', '') for p in self.prototypes)
-
 
     def _best_idx_for_unique_lab(self, uniq: np.ndarray, progress_callback=None) -> np.ndarray:
         """
@@ -2893,7 +2977,6 @@ class PyFCSWebApp:
 
         return out
 
-
     def _render_recolored_from_index_map(self, label_map_idx: np.ndarray, palette_uint8: np.ndarray) -> np.ndarray:
         """
         Fast recolor from prototype index map.
@@ -2910,7 +2993,6 @@ class PyFCSWebApp:
         if np.any(valid_mask):
             out[valid_mask] = palette_uint8[label_map_idx[valid_mask].astype(np.int32)]
         return out
-
 
     def _move_legend_next_to_image(self, window_id: str):
         """
@@ -2939,7 +3021,6 @@ class PyFCSWebApp:
                 legend.style.top = imgTop + 'px';
             }})()
         """)
-
 
     def _install_legend_follow_behavior(self, window_id: str):
         """
@@ -3014,12 +3095,10 @@ class PyFCSWebApp:
             }})();
         """)
 
-
     def _show_legend_window(self, window_id: str, labels, colors, info=None, mode='all'):
         """
         Show the legend in a separate floating window attached to the image window.
         """
-
         if not hasattr(self, "legend_windows"):
             self.legend_windows = {}
 
@@ -3131,7 +3210,9 @@ class PyFCSWebApp:
 
 
 
-    
+
+
+
     # ---------------------------------------------------------------------
     # SAVE IMAGE
     # ---------------------------------------------------------------------
@@ -3167,96 +3248,109 @@ class PyFCSWebApp:
         colors = self._label_colors_centroid() if scheme == 'centroid' else self._label_colors_hsv()
 
         # --- Legend layout parameters ---
-        pad = 12          # padding around the legend
-        swatch = 18       # swatch square size
-        line_h = 24       # height per legend row
+        pad = 12
+        swatch = 18
+        line_h = 24
         max_lines = max(1, len(labels))
 
-        # Output image = original height + legend height
         legend_h = pad * 2 + line_h * max_lines
         out = Image.new('RGB', (img.width, img.height + legend_h), (255, 255, 255))
         out.paste(img, (0, 0))
 
         draw = ImageDraw.Draw(out)
 
-        # Font setup (safe fallback if arial.ttf is unavailable)
         try:
             font = ImageFont.truetype("arial.ttf", 14)
         except Exception:
             font = ImageFont.load_default()
 
-        # Starting origin for legend content
         y0 = img.height + pad
         x0 = pad
 
-        # Draw each label row: swatch + label name
         for i, lab in enumerate(labels):
             rgb = colors.get(lab, np.array([0, 0, 0], dtype=np.uint8))
             fill_rgb = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
             y = y0 + i * line_h
 
-            # Color swatch (outlined in black)
             draw.rectangle(
                 [x0, y + 3, x0 + swatch, y + 3 + swatch],
                 fill=fill_rgb,
                 outline=(0, 0, 0)
             )
 
-            # Label text
+            draw.text((x0 + swatch + 10, y + 2), lab, fill=(0, 0, 0), font=font)
+
+        return out
+    
+
+
+    def _build_legend_image(self, window_id: str) -> Image.Image:
+        labels = list(getattr(self, 'color_matrix', []) or [])
+        scheme = self.scheme_cache.get(window_id, 'centroid')
+        colors = self._label_colors_centroid() if scheme == 'centroid' else self._label_colors_hsv()
+
+        pad = 12
+        swatch = 18
+        line_h = 24
+        width = 260
+        height = pad * 2 + line_h * max(1, len(labels))
+
+        out = Image.new('RGB', (width, height), (255, 255, 255))
+        draw = ImageDraw.Draw(out)
+
+        try:
+            font = ImageFont.truetype("arial.ttf", 14)
+        except Exception:
+            font = ImageFont.load_default()
+
+        y0 = pad
+        x0 = pad
+
+        for i, lab in enumerate(labels):
+            rgb = colors.get(lab, np.array([0, 0, 0], dtype=np.uint8))
+            fill_rgb = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+            y = y0 + i * line_h
+
+            draw.rectangle(
+                [x0, y + 3, x0 + swatch, y + 3 + swatch],
+                fill=fill_rgb,
+                outline=(0, 0, 0)
+            )
             draw.text((x0 + swatch + 10, y + 2), lab, fill=(0, 0, 0), font=font)
 
         return out
 
+
+
     def save_image(self):
         """
         Download an image from one of the currently open floating windows.
-
-        The user can choose:
-        - Which image window to save
-        - Output format: PNG or JPG
-        - Whether to include the legend (only meaningful if a mapping/label_map exists)
-
-        Save logic:
-        - If a mapped/processed image exists in self.modified_image[wid], that version is saved.
-        - Otherwise, the original image file is saved.
-        - If "Include legend" is enabled AND a label_map is cached for that window,
-          a legend block is appended at the bottom before encoding.
         """
-        # Must have at least one open image window
         wins = getattr(self, "image_windows", {})
         if not wins:
             self.custom_warning("Save Image", "There are no image windows to save.")
             return
 
-        # Build select options: window_id -> title
         options = {wid: wins[wid].get("title", wid) for wid in wins.keys()}
 
         with ui.dialog() as d, ui.card().classes('w-[520px]'):
             ui.label('Save Image').classes('text-lg font-bold')
             ui.label('Choose which image you want to download.').classes('text-sm text-gray-600')
 
-            # Select which floating window to export
             sel = ui.select(
                 options=options,
                 value=list(options.keys())[0],
                 label='Image window',
             ).classes('w-full')
 
-            # Export options
             include_legend = ui.checkbox('Include legend (if available)', value=True)
             fmt = ui.select(options=['png', 'jpg'], value='png', label='Format').classes('w-full')
 
             async def _download():
-                """
-                Encode and send the selected image to the browser as a download.
-                """
                 wid = sel.value
                 d.close()
 
                 try:
-                    # Decide which image data to export:
-                    # - mapped/processed image if available
-                    # - otherwise the original image
                     if hasattr(self, 'modified_image') and wid in self.modified_image:
                         arr = self.modified_image[wid]
                         pil = Image.fromarray(arr.astype(np.uint8), mode='RGB')
@@ -3264,11 +3358,17 @@ class PyFCSWebApp:
                         path = self.image_windows[wid]["path"]
                         pil = Image.open(path).convert('RGB')
 
-                    # Append legend if requested AND if we have a label_map for this window
-                    if include_legend.value and hasattr(self, 'label_map_cache') and wid in self.label_map_cache:
-                        pil = self._compose_with_legend(np.array(pil, dtype=np.uint8), wid)
+                    has_legend_for_window = (
+                        (hasattr(self, 'legend_windows') and wid in self.legend_windows)
+                        or (hasattr(self, 'scheme_cache') and wid in self.scheme_cache)
+                        or (hasattr(self, 'modified_image') and wid in self.modified_image)
+                    )
 
-                    # Encode to bytes
+                    legend_pil = None
+                    if include_legend.value and has_legend_for_window:
+                        legend_pil = self._build_legend_image(wid)
+
+                    # 1) preparar imagen principal
                     buf = io.BytesIO()
                     if fmt.value == 'jpg':
                         pil.save(buf, format='JPEG', quality=95)
@@ -3281,13 +3381,23 @@ class PyFCSWebApp:
 
                     data = buf.getvalue()
 
-                    # Build a safe download filename
                     base = self.image_windows[wid].get("title", wid).replace(' ', '_')
                     filename = f'{base}.{ext}'
 
-                    # Force browser download
+                    # 2) descargar imagen principal
                     ui.download(data, filename=filename, media_type=mime)
-                    ui.notify(f'Downloading: {filename}')
+
+                    # 3) descargar leyenda aparte si existe
+                    if legend_pil is not None:
+                        legend_buf = io.BytesIO()
+                        legend_pil.save(legend_buf, format='PNG')
+                        legend_data = legend_buf.getvalue()
+
+                        legend_filename = f'{base}_legend.png'
+                        ui.download(legend_data, filename=legend_filename, media_type='image/png')
+                        ui.notify(f'Downloading: {filename} + {legend_filename}')
+                    else:
+                        ui.notify(f'Downloading: {filename}')
 
                 except Exception as e:
                     self.custom_warning("Save Error", str(e))
