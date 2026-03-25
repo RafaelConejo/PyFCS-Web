@@ -95,7 +95,7 @@ class FuzzyColor():
         rep_cs   = pack["rep_cs"]
         rep_ss   = pack["rep_ss"]
 
-        best_idx = -1      # ✅ IMPORTANT
+        best_idx = -1      
         best_val = 0.0
 
         for i, proto in enumerate(prototypes):
@@ -141,7 +141,7 @@ class FuzzyColor():
                 best_val = value
                 best_idx = i
 
-        # ✅ If no prototype had membership > 0 → return -1
+        # If no prototype had membership > 0 → return -1
         if best_val == 0.0:
             return -1
 

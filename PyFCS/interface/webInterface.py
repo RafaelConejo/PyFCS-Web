@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 import hashlib
 import time
+import shutil
 
 ### current path ###
 current_dir = os.path.dirname(__file__)
@@ -50,6 +51,10 @@ class PyFCSWebApp:
         self.color_checkboxes = {}              # Dict: color_name -> checkbox reference (UI state control)
         self.loading_dialog = None              # Reference to the loading dialog (created once and reused)
         self.loading_label = None               # Label inside loading dialog to show current operation message
+        self.is_processing_mapping = False      # Flag indicating Color Mapping / Mapping All is running
+        self.cancel_mapping_requested = False   # Flag requested by user to cancel current mapping task
+        self.current_mapping_window_id = None       # Window id currently being processed
+        self.loading_cancel_btn = None          # Reference to the cancel button inside loading dialog
 
         # Lower value = faster mapping.
         self.PREVIEW_MAX_SIDE = 256
@@ -573,11 +578,12 @@ class PyFCSWebApp:
         d.open()
 
 
-
-    def show_loading(self, message="Processing..."):
+    def show_loading(self, message="Processing...", cancellable=False):
         """
         Show (or reuse) a loading dialog with a spinner and progress bar.
         """
+        self.set_ui_busy(True)
+
         if self.loading_dialog is None:
             self.loading_dialog = ui.dialog()
             with self.loading_dialog, ui.card().classes('w-80'):
@@ -586,13 +592,25 @@ class PyFCSWebApp:
                 self.loading_progress = ui.linear_progress(0).props(
                     'instant-feedback show-value=false indeterminate'
                 )
+                with ui.row().classes('justify-end w-full'):
+                    self.loading_cancel_btn = ui.button(
+                        'Cancel',
+                        on_click=self.cancel_current_mapping
+                    ).props('flat')
         else:
             self.loading_label.set_text(message)
             self.loading_progress.set_value(0)
             self.loading_progress.props('indeterminate')
 
-        self.loading_dialog.open()
+        if self.loading_cancel_btn is not None:
+            if cancellable:
+                self.loading_cancel_btn.enable()
+                self.loading_cancel_btn.style('display:block;')
+            else:
+                self.loading_cancel_btn.disable()
+                self.loading_cancel_btn.style('display:none;')
 
+        self.loading_dialog.open()
 
 
     def show_loading_color_space(self):
@@ -611,12 +629,42 @@ class PyFCSWebApp:
             self.loading_progress.set_value(round(max(0.0, min(1.0, value_0_to_1)), 2))
 
 
-
     def hide_loading(self):
         """Close the loading dialog if it exists."""
         if self.loading_dialog is not None:
             self.loading_dialog.close()
+
+        if self.loading_cancel_btn is not None:
+            self.loading_cancel_btn.disable()
+            self.loading_cancel_btn.style('display:none;')
+
         self.set_ui_busy(False)
+
+
+    def reopen_loading_if_busy(self, message="Processing..."):
+        """Reopen the loading dialog if a long-running task is already in progress."""
+        if getattr(self, 'is_processing_mapping', False):
+            if self.loading_label is not None:
+                self.loading_label.set_text(message)
+            if self.loading_dialog is not None:
+                self.loading_dialog.open()
+            return True
+        return False
+
+
+    def _is_window_mapping_locked(self, window_id: str) -> bool:
+        """Return True if the given window is currently running a mapping task."""
+        return (
+            getattr(self, 'is_processing_mapping', False)
+            and getattr(self, 'current_mapping_window_id', None) == window_id
+        )
+
+
+    def cancel_current_mapping(self):
+        """Request cancellation of the current mapping task."""
+        if self.is_processing_mapping:
+            self.cancel_mapping_requested = True
+            ui.notify('Cancelling current mapping...', color='warning')
 
     # ---------- callbacks ----------
     def exit_app(self):
@@ -2142,6 +2190,8 @@ class PyFCSWebApp:
             }})()
         """)
 
+
+
     def toggle_legend(self, window_id: str):
         """
         Show/hide the legend panel inside a given image window.
@@ -2162,15 +2212,19 @@ class PyFCSWebApp:
         if box:
             box.style('display:block;' if win["legend_visible"] else 'display:none;')
 
+
+
     def close_image_window(self, window_id: str):
         """
         Close an image floating window and purge all related cached data.
         """
+        if self._is_window_mapping_locked(window_id):
+            self.cancel_mapping_requested = True
+
         win = getattr(self, "image_windows", {}).get(window_id)
         if not win:
             return
 
-        # 1) Clean JS observers first, while the DOM node still exists
         ui.run_javascript(f"""
             (() => {{
                 const el = document.getElementById("{window_id}");
@@ -2184,16 +2238,13 @@ class PyFCSWebApp:
             }})();
         """)
 
-        # 2) Clean legend-follow hooks before deleting any element
         self._uninstall_legend_follow_behavior(window_id)
 
-        # 3) Delete separate legend window first
         if hasattr(self, "legend_windows") and window_id in self.legend_windows:
             lw = self.legend_windows.pop(window_id)
             if lw:
                 lw.delete()
 
-        # 4) Clear caches
         for k in list(getattr(self, "label_map_cache", {}).keys()):
             if isinstance(k, tuple) and len(k) > 0 and k[0] == window_id:
                 del self.label_map_cache[k]
@@ -2222,7 +2273,6 @@ class PyFCSWebApp:
         if hasattr(self, "MEMBERDEGREE_IMG") and window_id in self.MEMBERDEGREE_IMG:
             del self.MEMBERDEGREE_IMG[window_id]
 
-        # CHANGED: cleanup temporary upload folder if this image came from browser upload
         temp_dir = win.get("temp_dir")
         if temp_dir and os.path.isdir(temp_dir):
             try:
@@ -2230,12 +2280,12 @@ class PyFCSWebApp:
             except Exception:
                 pass
 
-        # 5) Delete the image card LAST
         if win.get("card") is not None:
             win["card"].delete()
 
-        # 6) Remove registry entry at the very end
         del self.image_windows[window_id]
+
+
 
     def _make_preview_data_url_from_path(self, path: str, max_side: int) -> str:
         """
@@ -2307,6 +2357,11 @@ class PyFCSWebApp:
         """
         Restore and display the original preview image in the floating window.
         """
+        if self._is_window_mapping_locked(window_id):
+            self.reopen_loading_if_busy("Color Mapping All...")
+            ui.notify('This image is currently being processed.', color='warning')
+            return
+
         try:
             win = self.image_windows[window_id]
             win["img"].set_source(win["original_source"])
@@ -2320,8 +2375,6 @@ class PyFCSWebApp:
             self._restore_window_position(window_id)
             ui.notify('Original image restored')
 
-            # CHANGED:
-            # Remove follow hooks before deleting the separate legend window.
             self._uninstall_legend_follow_behavior(window_id)
 
             if hasattr(self, "legend_windows") and window_id in self.legend_windows:
@@ -2332,34 +2385,27 @@ class PyFCSWebApp:
         except Exception as e:
             self.custom_warning("Display Error", str(e))
 
+
+
+
     def color_mapping(self, window_id: str):
         """
-        Apply a **single-prototype** membership visualization on the selected image window.
-
-        This operation:
-        - Requires a loaded color space (COLOR_SPACE == True).
-        - Lets the user pick ONE prototype label.
-        - Computes (or reuses) a membership map for that prototype:
-            * Result is a grayscale image where brightness ~ membership degree.
-        - Updates the floating window image source with the rendered output.
-        - Renders a legend that includes only the selected prototype label.
-
-        Caching strategy:
-        - proto_membership_cache[(window_id, chosen, max_side)] stores the computed grayscale map.
-        - proto_map_cache[(window_id, chosen, max_side, scheme)] stores the final PNG data URL + info text.
+        Apply a single-prototype membership visualization on the selected image window.
         """
-        # Require a loaded color space
+        if getattr(self, 'is_processing_mapping', False):
+            self.reopen_loading_if_busy("Color Mapping...")
+            ui.notify('A mapping task is already running.', color='warning')
+            return
+
         if not getattr(self, 'COLOR_SPACE', False):
             self.custom_warning("No Color Space", "Load a color space first (.cns or .fcs).")
             return
 
-        # Available labels come from color_matrix
         labels = list(getattr(self, 'color_matrix', []) or [])
         if not labels:
             self.custom_warning("No Data", "No colors loaded to map.")
             return
 
-        # Ensure caches exist
         if not hasattr(self, "proto_map_cache"):
             self.proto_map_cache = {}
         if not hasattr(self, "proto_membership_cache"):
@@ -2367,7 +2413,6 @@ class PyFCSWebApp:
         if not hasattr(self, "scheme_cache"):
             self.scheme_cache = {}
 
-        # Dialog: select which prototype to visualize
         with ui.dialog() as d, ui.card().classes('w-[520px]'):
             ui.label('Color Mapping (single prototype)').classes('text-lg font-bold')
             ui.label('Membership map for ONE prototype (grayscale).').classes('text-sm text-gray-600')
@@ -2375,27 +2420,46 @@ class PyFCSWebApp:
             sel = ui.select(options=labels, value=labels[0], label='Prototype').classes('w-full')
 
             async def _apply():
-                # Close dialog and start processing
                 d.close()
-                self.show_loading("Color Mapping...")
+
+                self.cancel_mapping_requested = False
+                self.is_processing_mapping = True
+                self.current_mapping_window_id = window_id
+
+                self.show_loading("Color Mapping...", cancellable=True)
 
                 try:
-                    max_side = self.PREVIEW_MAX_SIDE
+                    if self.cancel_mapping_requested:
+                        ui.notify("Mapping cancelled", color='warning')
+                        return
 
-                    # 1) Load a reduced working image (HxWx3 uint8)
+                    if window_id not in self.image_windows:
+                        ui.notify("Mapping cancelled because the image window was closed", color='warning')
+                        return
+
+                    max_side = self.PREVIEW_MAX_SIDE
                     img_np = self._get_work_image_np(window_id, max_side=max_side)
 
-                    chosen = sel.value
+                    if self.cancel_mapping_requested:
+                        ui.notify("Mapping cancelled", color='warning')
+                        return
 
-                    # Scheme does not affect grayscale, but kept in cache key for consistency
+                    if window_id not in self.image_windows:
+                        ui.notify("Mapping cancelled because the image window was closed", color='warning')
+                        return
+
+                    chosen = sel.value
                     scheme = self.scheme_cache.get(window_id, 'centroid')
                     cache_key = (window_id, chosen, max_side, scheme)
 
-                    # 2) If we already have the final rendered result, reuse it instantly
                     if cache_key in self.proto_map_cache:
                         data_url, info_text = self.proto_map_cache[cache_key]
 
-                        win = self.image_windows[window_id]
+                        win = self.image_windows.get(window_id)
+                        if not win:
+                            ui.notify("Mapping cancelled because the image window was closed", color='warning')
+                            return
+
                         win["img"].set_source(data_url)
                         win["current_source"] = data_url
                         self._restore_window_position(window_id)
@@ -2407,37 +2471,52 @@ class PyFCSWebApp:
                             mode='single',
                         )
 
-                        # Update window state flags
                         self.ORIGINAL_IMG[window_id] = True
                         if hasattr(self, "MEMBERDEGREE"):
                             self.MEMBERDEGREE[window_id] = False
                         return
 
-                    # 3) Compute membership map ONLY for this prototype (cached separately)
                     mkey = (window_id, chosen, max_side)
                     if mkey in self.proto_membership_cache:
                         gray = self.proto_membership_cache[mkey]
                     else:
                         proto_index = self._proto_index_by_label(chosen)
-                        gray = await asyncio.to_thread(self._membership_map_for_prototype, img_np, proto_index)
+                        gray = await asyncio.to_thread(
+                            self._membership_map_for_prototype,
+                            img_np,
+                            proto_index
+                        )
+
+                        if gray is None:
+                            ui.notify("Mapping cancelled", color='warning')
+                            return
+
                         self.proto_membership_cache[mkey] = gray
 
-                    # 4) Convert grayscale to 3-channel RGB for ui.image
+                    if self.cancel_mapping_requested:
+                        ui.notify("Mapping cancelled", color='warning')
+                        return
+
+                    if window_id not in self.image_windows:
+                        ui.notify("Mapping cancelled because the image window was closed", color='warning')
+                        return
+
                     out = np.stack([gray, gray, gray], axis=-1)
 
-                    # Percentage of pixels with non-zero membership
                     pct = float((gray > 0).sum()) / float(gray.size) * 100.0
                     info_text = f'Selected: {chosen} — {pct:.2f}% (nonzero membership)'
 
-                    # Store last output and update window image
                     self.modified_image[window_id] = out
                     data_url = self._np_to_data_url(out)
 
-                    win = self.image_windows[window_id]
+                    win = self.image_windows.get(window_id)
+                    if not win:
+                        ui.notify("Mapping cancelled because the image window was closed", color='warning')
+                        return
+
                     win["img"].set_source(data_url)
                     win["current_source"] = data_url
 
-                    # 5) Render legend for only the chosen label (and hide alt-colors button)
                     self._render_legend(
                         window_id,
                         only_labels=[chosen],
@@ -2445,23 +2524,27 @@ class PyFCSWebApp:
                         mode='single',
                     )
 
-                    # Cache final render for instant reuse
                     self.proto_map_cache[cache_key] = (data_url, info_text)
 
-                    # Update window flags
                     self.ORIGINAL_IMG[window_id] = True
                     if hasattr(self, "MEMBERDEGREE"):
                         self.MEMBERDEGREE[window_id] = False
 
                 except Exception as e:
                     self.custom_warning("Processing Error", str(e))
+
                 finally:
+                    self.is_processing_mapping = False
+                    self.cancel_mapping_requested = False
+                    self.current_mapping_window_id = None
                     self.hide_loading()
 
             with ui.row().classes('justify-end gap-2'):
                 ui.button('Cancel', on_click=d.close).props('flat')
                 ui.button('Apply', icon='palette', on_click=_apply)
         d.open()
+
+
 
     def _np_to_data_url(self, arr_uint8: np.ndarray) -> str:
         """
@@ -2513,6 +2596,8 @@ class PyFCSWebApp:
             out[label] = rgb255
         return out
 
+
+
     def _label_colors_hsv(self) -> dict:
         """
         Build a mapping: label -> RGB uint8 using an HSV colormap.
@@ -2545,6 +2630,8 @@ class PyFCSWebApp:
 
             out[lab] = rgb255
         return out
+
+
 
     def _compute_label_map(self, img_uint8: np.ndarray, progress_callback=None) -> np.ndarray:
         """
@@ -2580,45 +2667,49 @@ class PyFCSWebApp:
         label_map = best_for_uniq[inv].reshape(h, w).astype(np.int32)
         return label_map
 
+
+
+
     def color_mapping_all(self, window_id: str):
         """
-        Apply **full image** color mapping using fast prototype-index mapping.
-
-        OPTIMIZATIONS APPLIED:
-        1) Reuse label_map when only palette changes
-        2) Cache by actual preview image content
-        3) Avoid repeated RGB->LAB conversion by using precomputed preview cache
-        4) Reuse unique quantized LAB colors + inverse mapping
-        5) Global cache for best_prototype_index_from_lab
-        6) More aggressive LAB quantization for web preview
-
-        IMPORTANT:
-        The display always uses the reduced-size preview, so the visual size remains
-        stable when switching between Original / Color Mapping / Color Mapping All.
+        Apply full image color mapping using fast prototype-index mapping.
         """
         if not getattr(self, 'COLOR_SPACE', False):
             self.custom_warning("No Color Space", "Load a color space first (.cns or .fcs).")
             return
 
+        if getattr(self, 'is_processing_mapping', False):
+            self.reopen_loading_if_busy("Color Mapping All...")
+            ui.notify('A mapping task is already running.', color='warning')
+            return
+
         client = context.client
 
         async def _run():
+            self.cancel_mapping_requested = False
+            self.is_processing_mapping = True
+            self.current_mapping_window_id = window_id
+
             with client:
-                self.show_loading("Color Mapping All...")
+                self.show_loading("Color Mapping All...", cancellable=True)
 
             try:
                 self.fuzzy_color_space.precompute_pack()
 
-                # CHANGED:
-                # Ensure preview preprocessing is ready only once.
+                if self.cancel_mapping_requested:
+                    with client:
+                        ui.notify("Mapping cancelled", color='warning')
+                    return
+
                 self._prepare_window_preview_cache(window_id)
-                win = self.image_windows[window_id]
+                win = self.image_windows.get(window_id)
+                if not win:
+                    with client:
+                        ui.notify("Mapping cancelled because the image window was closed", color='warning')
+                    return
 
                 preview_hash = win["preview_hash"]
                 proto_sig = self._prototype_signature()
-
-                # CHANGED:
-                # Cache by actual preview content + prototypes, not just by window_id.
                 cache_key = (preview_hash, proto_sig)
 
                 if not hasattr(self, "cm_cache"):
@@ -2627,11 +2718,11 @@ class PyFCSWebApp:
                     self.cm_cache[window_id] = {}
 
                 def progress(cur, total):
+                    if self.cancel_mapping_requested:
+                        return
                     with client:
                         self.set_loading_progress(cur / total)
 
-                # CHANGED:
-                # Reuse precomputed uniq/inv instead of recomputing RGB->LAB and np.unique every time.
                 if cache_key not in self.cm_cache[window_id]:
                     uniq = win["uniq"]
                     inv = win["inv"]
@@ -2639,6 +2730,22 @@ class PyFCSWebApp:
                     w = win["preview_w"]
 
                     best_for_uniq = await asyncio.to_thread(self._best_idx_for_unique_lab, uniq, progress)
+
+                    if best_for_uniq is None:
+                        with client:
+                            ui.notify("Mapping cancelled", color='warning')
+                        return
+
+                    if self.cancel_mapping_requested:
+                        with client:
+                            ui.notify("Mapping cancelled", color='warning')
+                        return
+
+                    if window_id not in self.image_windows:
+                        with client:
+                            ui.notify("Mapping cancelled because the image window was closed", color='warning')
+                        return
+
                     label_map = best_for_uniq[inv].reshape(h, w).astype(np.int32)
 
                     self.cm_cache[window_id][cache_key] = {
@@ -2649,33 +2756,69 @@ class PyFCSWebApp:
                 else:
                     label_map = self.cm_cache[window_id][cache_key]["label_map"]
 
-                # CHANGED:
-                # Recolor instantly from cached label_map when only palette changes.
+                if self.cancel_mapping_requested:
+                    with client:
+                        ui.notify("Mapping cancelled", color='warning')
+                    return
+
+                if window_id not in self.image_windows:
+                    with client:
+                        ui.notify("Mapping cancelled because the image window was closed", color='warning')
+                    return
+
                 scheme = self.scheme_cache.get(window_id, 'centroid')
                 palette = self._palette_centroid_uint8() if scheme == 'centroid' else self._palette_hsv_uint8()
 
                 out = self._render_recolored_from_index_map(label_map, palette)
 
+                if self.cancel_mapping_requested:
+                    with client:
+                        ui.notify("Mapping cancelled", color='warning')
+                    return
+
+                if window_id not in self.image_windows:
+                    with client:
+                        ui.notify("Mapping cancelled because the image window was closed", color='warning')
+                    return
+
                 self.modified_image[window_id] = out
                 data_url = self._np_to_data_url(out)
 
                 with client:
-                    win = self.image_windows[window_id]
+                    win = self.image_windows.get(window_id)
+                    if not win:
+                        with client:
+                            ui.notify("Mapping cancelled because the image window was closed", color='warning')
+                        return
+
                     win["img"].set_source(data_url)
                     win["current_source"] = data_url
                     self._render_legend(window_id)
                     self._restore_window_position(window_id)
                     ui.notify('Color mapping applied (preview)')
 
+            except RuntimeError as e:
+                msg = str(e)
+                with client:
+                    if "cancelled" in msg.lower():
+                        ui.notify(msg, color='warning')
+                    else:
+                        self.custom_warning("Processing Error", msg)
+
             except Exception as e:
                 with client:
                     self.custom_warning("Processing Error", str(e))
 
             finally:
+                self.is_processing_mapping = False
+                self.cancel_mapping_requested = False
+                self.current_mapping_window_id = None
                 with client:
                     self.hide_loading()
 
         asyncio.create_task(_run())
+
+
 
     def _get_work_image_np(self, window_id: str, max_side: int) -> np.ndarray:
         """
@@ -2764,6 +2907,8 @@ class PyFCSWebApp:
         self._restore_window_position(window_id)
         self._render_legend(window_id)
 
+
+
     def _proto_index_by_label(self, label: str) -> int:
         """
         Return the index of a Prototype in self.prototypes matching the given label.
@@ -2777,6 +2922,8 @@ class PyFCSWebApp:
             if getattr(p, 'label', None) == label:
                 return i
         raise ValueError(f'Prototype not found: {label}')
+
+
 
     def _membership_map_for_prototype(self, img_np_rgb255: np.ndarray, proto_index: int, progress_cb=None) -> np.ndarray:
         """
@@ -2803,6 +2950,9 @@ class PyFCSWebApp:
         fcs = self.fuzzy_color_space
 
         for i, key_int in enumerate(uniq):
+            if getattr(self, 'cancel_mapping_requested', False):
+                return None
+        
             lab_color = key_int.astype(np.float32) * step
             unique_memberships[i] = fcs.calculate_membership_for_prototype(
                 np.array([lab_color[0], lab_color[1], lab_color[2]], dtype=float),
@@ -2815,6 +2965,8 @@ class PyFCSWebApp:
         gray = (unique_memberships[inv].reshape(h, w) * 255.0)
         gray = np.clip(gray, 0, 255).astype(np.uint8)
         return gray
+    
+
 
     def _image_hash(self, arr: np.ndarray) -> str:
         """
@@ -2822,6 +2974,8 @@ class PyFCSWebApp:
         Used to cache mapping results by actual preview content.
         """
         return hashlib.blake2b(arr.tobytes(), digest_size=16).hexdigest()
+
+
 
     def _quantize_lab(self, lab_img: np.ndarray) -> np.ndarray:
         """
@@ -2832,6 +2986,8 @@ class PyFCSWebApp:
         """
         step = float(getattr(self, 'LAB_QUANT_STEP', 0.05))
         return np.round(lab_img / step) * step
+
+
 
     def _prepare_window_preview_cache(self, window_id: str):
         """
@@ -2883,6 +3039,8 @@ class PyFCSWebApp:
         win["preview_w"] = w
         win["preview_cache_ready"] = True
 
+
+
     def _palette_centroid_uint8(self) -> np.ndarray:
         """
         Build a palette array (N,3) uint8 in self.prototypes order using centroid colors.
@@ -2911,6 +3069,8 @@ class PyFCSWebApp:
 
         return np.stack(palette, axis=0).astype(np.uint8)
 
+
+
     def _palette_hsv_uint8(self) -> np.ndarray:
         """
         Build a palette array (N,3) uint8 in self.prototypes order using HSV colors.
@@ -2929,6 +3089,8 @@ class PyFCSWebApp:
 
         return np.stack(palette, axis=0).astype(np.uint8)
 
+
+
     def _prototype_signature(self) -> tuple:
         """
         Signature of current prototype set / order.
@@ -2936,17 +3098,11 @@ class PyFCSWebApp:
         """
         return tuple(getattr(p, 'label', '') for p in self.prototypes)
 
+
+
     def _best_idx_for_unique_lab(self, uniq: np.ndarray, progress_callback=None) -> np.ndarray:
         """
         Compute best prototype index for each unique quantized LAB key.
-
-        Uses a global cache:
-            (proto_signature, Lq, Aq, Bq) -> best_idx
-
-        Returns
-        -------
-        np.ndarray
-            int32 array of shape (len(uniq),), values in [-1, N-1]
         """
         if not hasattr(self, "best_idx_cache"):
             self.best_idx_cache = {}
@@ -2955,10 +3111,12 @@ class PyFCSWebApp:
         step = float(getattr(self, 'LAB_QUANT_STEP', 0.05))
 
         out = np.empty((uniq.shape[0],), dtype=np.int32)
-
         total = int(uniq.shape[0])
 
         for i in range(total):
+            if getattr(self, 'cancel_mapping_requested', False):
+                return None
+
             key_int = uniq[i]
             cache_key = (proto_sig, int(key_int[0]), int(key_int[1]), int(key_int[2]))
 
@@ -2976,6 +3134,8 @@ class PyFCSWebApp:
                 progress_callback(i + 1, total)
 
         return out
+            
+
 
     def _render_recolored_from_index_map(self, label_map_idx: np.ndarray, palette_uint8: np.ndarray) -> np.ndarray:
         """
